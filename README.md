@@ -5,6 +5,11 @@ Using v0rtex (https://github.com/Siguza/v0rtex) as the starting point. The origi
 The code contains snippets collected from a wide range of projects. Includes the stuff from older jailbreaks, iOS 11 WIP code,  They all belong to their respective owners.
 
 Completed:
-SSH Access
-Rootfs remount as r/w
-AMFI patches to run unsigned binaries
+
+- SSH using dropbear
+
+- Root access
+
+- Rootfs remount as r/w
+
+- AMFI patches to run unsigned binaries
