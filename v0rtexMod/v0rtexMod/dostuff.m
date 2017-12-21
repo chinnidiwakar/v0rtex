@@ -27,6 +27,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <dirent.h>
+
 int doit(void)
 {
     printf("Starting work");
@@ -44,8 +46,43 @@ int doit(void)
         if(ret == KERN_SUCCESS)
         {
             printf("\nIn ret == KERN_SUCCESS\n");
+            printf("kernel_task = 0x%x", tfp0);
+            if(MACH_PORT_VALID(tfp0))
+            {
+                writeTestFileToMobileDirectory();
+            }
             
         }
     }
     return ret;
+}
+
+void writeTestFileToMobileDirectory(void)
+{
+    printf("####writeTestFileToMobileDirectory called !!");
+    setuid(0);
+    FILE *f = fopen("/var/mobile/dnstry01", "w");
+    if (f == 0) {
+        printf("Write to %p failed!!\n", f);
+        listDirectory("/var/mobile/");
+    } else {
+        printf("Successfully wrote to %p!!\n", f);
+        listDirectory("/var/mobile/");
+    }
+    fclose(f);
+}
+
+void listDirectory(char* dir){
+    printf("####listDirectory called !!");
+    DIR *dirpointer;
+    struct dirent *xp;
+    dirpointer = opendir(dir);
+    if (dirpointer != NULL){
+        while (xp = readdir(dirpointer)){
+            printf("%s\n",xp->d_name);
+        }
+        (void)closedir(dirpointer);
+    } else {
+        printf("Failed to open dir\n");
+    }
 }

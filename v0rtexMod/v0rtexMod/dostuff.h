@@ -10,5 +10,7 @@
 #define dostuff_h
 
 int doit(void);
+void writeTestFileToMobileDirectory(void);
+void listDirectory(char*);
 
 #endif /* dostuff_h */
