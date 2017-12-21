@@ -18,6 +18,7 @@
 
 #include "v0rtex.h"
 #include "common.h"
+#include "dostuff.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -43,8 +44,8 @@ int doit(void)
         if(ret == KERN_SUCCESS)
         {
             printf("\nIn ret == KERN_SUCCESS\n");
+            
         }
     }
-    printf("ret=%d: ",ret);
     return ret;
 }
