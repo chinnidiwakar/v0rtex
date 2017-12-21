@@ -18,6 +18,7 @@
 		EA11A2A41FEB54A600F64773 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA11A29B1FEB503C00F64773 /* UIKit.framework */; };
 		EA11A2A51FEB54A900F64773 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA11A2A01FEB527700F64773 /* IOKit.framework */; };
 		EAD5E3B21FEB5AC000AD95D9 /* symbols.m in Sources */ = {isa = PBXBuildFile; fileRef = EAD5E3B11FEB5AC000AD95D9 /* symbols.m */; };
+		EAD5E3B51FEB5EF700AD95D9 /* dostuff.m in Sources */ = {isa = PBXBuildFile; fileRef = EAD5E3B41FEB5EF700AD95D9 /* dostuff.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -39,6 +40,8 @@
 		EA11A2A01FEB527700F64773 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = ../../../../../../System/Library/Frameworks/IOKit.framework; sourceTree = "<group>"; };
 		EAD5E3B11FEB5AC000AD95D9 /* symbols.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = symbols.m; sourceTree = "<group>"; };
 		EAD5E3B31FEB5ACF00AD95D9 /* symbols.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = symbols.h; sourceTree = "<group>"; };
+		EAD5E3B41FEB5EF700AD95D9 /* dostuff.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = dostuff.m; sourceTree = "<group>"; };
+		EAD5E3B61FEB5F0200AD95D9 /* dostuff.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = dostuff.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -76,6 +79,8 @@
 			children = (
 				EA11A27E1FEB4DA400F64773 /* AppDelegate.h */,
 				EAD5E3B31FEB5ACF00AD95D9 /* symbols.h */,
+				EAD5E3B61FEB5F0200AD95D9 /* dostuff.h */,
+				EAD5E3B41FEB5EF700AD95D9 /* dostuff.m */,
 				EAD5E3B11FEB5AC000AD95D9 /* symbols.m */,
 				EA11A2981FEB4FE100F64773 /* IOKit */,
 				EA11A2971FEB4E5600F64773 /* common.h */,
@@ -175,6 +180,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				EAD5E3B21FEB5AC000AD95D9 /* symbols.m in Sources */,
+				EAD5E3B51FEB5EF700AD95D9 /* dostuff.m in Sources */,
 				EA11A2951FEB4DE000F64773 /* v0rtex.m in Sources */,
 				EA11A2831FEB4DA400F64773 /* ViewController.m in Sources */,
 				EA11A28E1FEB4DA400F64773 /* main.m in Sources */,
@@ -315,6 +321,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = T2NR4WA7GR;
 				ENABLE_BITCODE = NO;
+				GCC_NO_COMMON_BLOCKS = NO;
 				INFOPLIST_FILE = v0rtexMod/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 10.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
@@ -338,6 +345,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = T2NR4WA7GR;
 				ENABLE_BITCODE = NO;
+				GCC_NO_COMMON_BLOCKS = NO;
 				INFOPLIST_FILE = v0rtexMod/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 10.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";

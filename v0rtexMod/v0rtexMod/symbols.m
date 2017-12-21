@@ -36,11 +36,11 @@ BOOL init_symbols()
     struct utsname u;
     uname(&u);
     
-    LOG("sysname: %s", u.sysname);
-    LOG("nodename: %s", u.nodename);
-    LOG("release: %s", u.release);
-    LOG("version: %s", u.version);
-    LOG("machine: %s", u.machine);
+    printf("sysname: %s", u.sysname);
+    printf("nodename: %s", u.nodename);
+    printf("release: %s", u.release);
+    printf("version: %s", u.version);
+    printf("machine: %s", u.machine);
     
     if (strcmp(u.machine, "iPhone9,3") == 0)
     {
@@ -103,8 +103,8 @@ BOOL init_symbols()
         OFFSET_ROOT_MOUNT_V_NODE                    = 0xfffffff0075a80b0;
     }else
     {
-        LOG("Device not supported.");
-        LOG("\nDevice version is: ",u.version);
+        printf("Device not supported.");
+        printf("\nDevice version is: ",u.version);
         return FALSE;
     }
     

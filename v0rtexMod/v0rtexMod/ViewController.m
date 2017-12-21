@@ -9,6 +9,7 @@
 #import "ViewController.h"
 #import "v0rtex.h"
 #import "symbols.h"
+#import "dostuff.h"
 
 @interface ViewController ()
 
@@ -19,6 +20,27 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     // Do any additional setup after loading the view, typically from a nib.
+    
+    //Writing stuff directly here during the test phase coz am lazy to click the button
+    
+    if (init_symbols()) {
+        printf("Symbols found will proceed.\n");
+    }else{
+        printf("Device not supported.");
+        return;
+    }
+    
+    if(getuid() != 0)
+    {
+        NSLog(@"getuid() != 0\n");
+        
+        if(doit()==0)
+        {
+            printf("w00tw00t!!\n");
+        }else{
+            printf("doit failed!\n");
+        }
+    }
 }
 
 
@@ -39,10 +61,24 @@
     
     //Initialize the symbols
     if (init_symbols()) {
-        LOG("Symbols found will proceed.");
+        printf("Symbols found will proceed.\n");
     }else{
-        LOG("Device not supported.");
+        printf("Device not supported.");
         return;
     }
+    
+    if(getuid() != 0)
+    {
+        NSLog(@"getuid() != 0\n");
+        
+        if(doit()==0)
+        {
+            printf("w00tw00t doit() successed!!\n");
+            
+        }else{
+            printf("doit failed!\n");
+        }
+    }
+    
 }
 @end
