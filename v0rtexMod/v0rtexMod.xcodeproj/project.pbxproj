@@ -17,6 +17,8 @@
 		EA11A2991FEB4FE100F64773 /* IOKit in Resources */ = {isa = PBXBuildFile; fileRef = EA11A2981FEB4FE100F64773 /* IOKit */; };
 		EA11A2A41FEB54A600F64773 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA11A29B1FEB503C00F64773 /* UIKit.framework */; };
 		EA11A2A51FEB54A900F64773 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA11A2A01FEB527700F64773 /* IOKit.framework */; };
+		EA3FA0E71FEB7041006F7F11 /* remountrootrw.m in Sources */ = {isa = PBXBuildFile; fileRef = EA3FA0E61FEB7040006F7F11 /* remountrootrw.m */; };
+		EA3FA0EA1FEB71CC006F7F11 /* kernelutils.m in Sources */ = {isa = PBXBuildFile; fileRef = EA3FA0E91FEB71CC006F7F11 /* kernelutils.m */; };
 		EAD5E3B21FEB5AC000AD95D9 /* symbols.m in Sources */ = {isa = PBXBuildFile; fileRef = EAD5E3B11FEB5AC000AD95D9 /* symbols.m */; };
 		EAD5E3B51FEB5EF700AD95D9 /* dostuff.m in Sources */ = {isa = PBXBuildFile; fileRef = EAD5E3B41FEB5EF700AD95D9 /* dostuff.m */; };
 /* End PBXBuildFile section */
@@ -38,6 +40,10 @@
 		EA11A2981FEB4FE100F64773 /* IOKit */ = {isa = PBXFileReference; lastKnownFileType = folder; path = IOKit; sourceTree = "<group>"; };
 		EA11A29B1FEB503C00F64773 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		EA11A2A01FEB527700F64773 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = ../../../../../../System/Library/Frameworks/IOKit.framework; sourceTree = "<group>"; };
+		EA3FA0E61FEB7040006F7F11 /* remountrootrw.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = remountrootrw.m; sourceTree = "<group>"; };
+		EA3FA0E81FEB704C006F7F11 /* remountrootrw.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = remountrootrw.h; sourceTree = "<group>"; };
+		EA3FA0E91FEB71CC006F7F11 /* kernelutils.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = kernelutils.m; sourceTree = "<group>"; };
+		EA3FA0EB1FEB71EE006F7F11 /* kernelutils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = kernelutils.h; sourceTree = "<group>"; };
 		EAD5E3B11FEB5AC000AD95D9 /* symbols.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = symbols.m; sourceTree = "<group>"; };
 		EAD5E3B31FEB5ACF00AD95D9 /* symbols.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = symbols.h; sourceTree = "<group>"; };
 		EAD5E3B41FEB5EF700AD95D9 /* dostuff.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = dostuff.m; sourceTree = "<group>"; };
@@ -86,7 +92,11 @@
 				EA11A2971FEB4E5600F64773 /* common.h */,
 				EA11A27F1FEB4DA400F64773 /* AppDelegate.m */,
 				EA11A2811FEB4DA400F64773 /* ViewController.h */,
+				EA3FA0E91FEB71CC006F7F11 /* kernelutils.m */,
+				EA3FA0EB1FEB71EE006F7F11 /* kernelutils.h */,
 				EA11A2821FEB4DA400F64773 /* ViewController.m */,
+				EA3FA0E81FEB704C006F7F11 /* remountrootrw.h */,
+				EA3FA0E61FEB7040006F7F11 /* remountrootrw.m */,
 				EA11A2841FEB4DA400F64773 /* Main.storyboard */,
 				EA11A2871FEB4DA400F64773 /* Assets.xcassets */,
 				EA11A2891FEB4DA400F64773 /* LaunchScreen.storyboard */,
@@ -181,7 +191,9 @@
 			files = (
 				EAD5E3B21FEB5AC000AD95D9 /* symbols.m in Sources */,
 				EAD5E3B51FEB5EF700AD95D9 /* dostuff.m in Sources */,
+				EA3FA0EA1FEB71CC006F7F11 /* kernelutils.m in Sources */,
 				EA11A2951FEB4DE000F64773 /* v0rtex.m in Sources */,
+				EA3FA0E71FEB7041006F7F11 /* remountrootrw.m in Sources */,
 				EA11A2831FEB4DA400F64773 /* ViewController.m in Sources */,
 				EA11A28E1FEB4DA400F64773 /* main.m in Sources */,
 				EA11A2801FEB4DA400F64773 /* AppDelegate.m in Sources */,

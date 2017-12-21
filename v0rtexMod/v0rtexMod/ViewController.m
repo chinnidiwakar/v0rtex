@@ -74,6 +74,8 @@
         if(doit()==0)
         {
             printf("w00tw00t doit() successed!!\n");
+            setuid(0);
+            
             
         }else{
             printf("doit failed!\n");

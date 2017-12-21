@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 
 #include <dirent.h>
+#include "remountrootrw.h"
 
 int doit(void)
 {
@@ -45,30 +46,60 @@ int doit(void)
         
         if(ret == KERN_SUCCESS)
         {
+            
             printf("\nIn ret == KERN_SUCCESS\n");
-            printf("kernel_task = 0x%x", tfp0);
+            printf("kernel_task = 0x%x\n", tfp0);
             if(MACH_PORT_VALID(tfp0))
             {
-                writeTestFileToMobileDirectory();
+                setuid(0);
+             //   writeTestFileToMobileDirectory();
+                remountRootfs(tfp0, kslide);
+                writeTestFileToSpecifiedDirectory(".dnstest0003", "/");
+                unlink(".dnstest0001");
             }
         }
     }
     return ret;
 }
 
-void writeTestFileToMobileDirectory(void)
+//void writeTestFileToMobileDirectory(void)
+//{
+//    printf("####writeTestFileToMobileDirectory called !!");
+//    setuid(0);
+//    FILE *f = fopen("/var/mobile/dnstry01", "w");
+//    if (f == 0) {
+//        printf("Write to %p failed!!\n", f);
+//        listDirectory("/var/mobile/");
+//    } else {
+//        printf("Successfully wrote to %p!!\n", f);
+//        listDirectory("/var/mobile/");
+//    }
+//    fclose(f);
+//}
+
+void writeTestFileToSpecifiedDirectory(char* filename, char* dirtolist)
 {
-    printf("####writeTestFileToMobileDirectory called !!");
+    printf("####writeTestFileToSpecifiedDirectory called !!");
     setuid(0);
-    FILE *f = fopen("/var/mobile/dnstry01", "w");
+    FILE *f = fopen(filename, "w");
     if (f == 0) {
-        printf("Write to %p failed!!\n", f);
-        listDirectory("/var/mobile/");
+        printf("Write to %s failed!!\n", filename);
+     //   listDirectory(dirtolist);
     } else {
-        printf("Successfully wrote to %p!!\n", f);
-        listDirectory("/var/mobile/");
+        printf("Successfully wrote to %s!!\n", filename);
+      //  listDirectory(dirtolist);
     }
     fclose(f);
+}
+
+void remountRootfs(task_t tfp0, uint64_t kslide)
+{
+    int remountStatus = remountrootrw(tfp0, kslide);
+    printf("remountStatus=%d",remountStatus);
+    if (remountStatus == 0) {
+        printf("\nremount success\n");
+    }
+    
 }
 
 void listDirectory(char* dir){
@@ -77,7 +108,7 @@ void listDirectory(char* dir){
     struct dirent *xp;
     dirpointer = opendir(dir);
     if (dirpointer != NULL){
-        while (xp == readdir(dirpointer)){
+        while (xp = readdir(dirpointer)){
             printf("%s\n",xp->d_name);
         }
         (void)closedir(dirpointer);
