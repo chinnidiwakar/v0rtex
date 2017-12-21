@@ -8,6 +8,7 @@
 
 #import "ViewController.h"
 #import "v0rtex.h"
+#import "symbols.h"
 
 @interface ViewController ()
 
@@ -29,12 +30,19 @@
 
 - (IBAction)startButton:(id)sender {
     NSLog(@"And it starts !!");
-    kern_return_t ret = v0rtex(NULL, NULL);
+//    kern_return_t ret = v0rtex(NULL, NULL);
+//
+//    if(ret == KERN_SUCCESS)
+//    {
+//        printf("ret == KERN_SUCCESS");
+//    }
     
-    if(ret == KERN_SUCCESS)
-    {
-        printf("ret == KERN_SUCCESS");
+    //Initialize the symbols
+    if (init_symbols()) {
+        LOG("Symbols found will proceed.");
+    }else{
+        LOG("Device not supported.");
+        return;
     }
-    
 }
 @end

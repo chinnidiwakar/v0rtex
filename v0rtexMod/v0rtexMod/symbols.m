@@ -104,7 +104,7 @@ BOOL init_symbols()
     }else
     {
         LOG("Device not supported.");
-        LOG("\nDevice version is",u.version);
+        LOG("\nDevice version is: ",u.version);
         return FALSE;
     }
     
