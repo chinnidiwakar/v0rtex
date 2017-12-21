@@ -51,7 +51,6 @@ int doit(void)
             {
                 writeTestFileToMobileDirectory();
             }
-            
         }
     }
     return ret;
@@ -78,7 +77,7 @@ void listDirectory(char* dir){
     struct dirent *xp;
     dirpointer = opendir(dir);
     if (dirpointer != NULL){
-        while (xp = readdir(dirpointer)){
+        while (xp == readdir(dirpointer)){
             printf("%s\n",xp->d_name);
         }
         (void)closedir(dirpointer);
